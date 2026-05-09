@@ -93,7 +93,9 @@ def test_json_format_includes_all_fields(capture_events):
     assert payload["event"] == "credential_captured"
     assert payload["session_uuid"] == "abc-123"
     assert payload["auth_string"] == "dGVzdDp0ZXN0"
-    assert "ts" in payload
+    # Log shipper / docker / journald supplies the ingestion timestamp;
+    # we don't include a duplicate ``ts`` field in the message body.
+    assert "ts" not in payload
 
 
 def test_json_format_session_ended_summary_flattened(capture_events):
@@ -123,6 +125,27 @@ def test_json_format_session_ended_summary_flattened(capture_events):
     assert payload["credentials"] == summary["credentials"]
     assert payload["last_response_code"] == 221
     assert payload["mail"] == summary["mail"]
+
+
+def test_json_operational_formatter_renders_log_record():
+    """Operational records (mailoney.core etc.) get a uniform JSON shape."""
+    formatter = events.JsonOperationalFormatter()
+    record = logging.LogRecord(
+        name="mailoney.core",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg="Connection from %s:%d",
+        args=("1.2.3.4", 4444),
+        exc_info=None,
+    )
+    payload = json.loads(formatter.format(record))
+    assert payload == {
+        "event": "log",
+        "logger": "mailoney.core",
+        "level": "INFO",
+        "message": "Connection from 1.2.3.4:4444",
+    }
 
 
 def test_init_event_logging_is_idempotent():

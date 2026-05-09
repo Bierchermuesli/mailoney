@@ -118,7 +118,7 @@ python main.py
 | `MAILONEY_TLS_CERT` | Path to a PEM cert/chain. Both `MAILONEY_TLS_CERT` and `MAILONEY_TLS_KEY` must be set to enable STARTTLS. | (unset) |
 | `MAILONEY_TLS_KEY` | Path to the PEM private key matching `MAILONEY_TLS_CERT`. | (unset) |
 | `MAILONEY_LOG_LEVEL` | Logging level | INFO |
-| `MAILONEY_LOG_JSON` | When `true`, emit honeypot events (session start/end, captured credentials) as JSON Lines on the `mailoney.events` logger. Default emits human-readable text. | false |
+| `MAILONEY_LOG_JSON` | When `true`, every log line on stdout — both honeypot events (session start/end, captured credentials) and operational records (`mailoney.core`, `mailoney.mail_storage`, …) — is emitted as JSON Lines. Default emits human-readable text for both. | false |
 | `MAILONEY_METRICS_PORT` | Port for the Prometheus `/metrics` endpoint. Unset disables the endpoint. | (unset) |
 | `MAILONEY_METRICS_BIND` | Bind address for the metrics endpoint. Default is dual-stack IPv4+IPv6. | `::` |
 
@@ -141,7 +141,10 @@ When the database is disabled:
   runtime.
 - Per-session events (`session_started`, `credential_captured`,
   `session_ended`) are emitted to the `mailoney.events` logger.
-- In JSON mode, `session_ended` events include the full SMTP transcript.
+- `session_ended` carries a per-session summary — source/destination,
+  duration, command list, last response code, and any captured
+  credentials. Text mode drops the command and credential lists for
+  readability; JSON mode keeps them.
 
 ### Command-line Arguments
 

@@ -62,7 +62,34 @@ def test_configure_logging():
     # This is more of a smoke test since it's hard to test logging configuration
     configure_logging("DEBUG")
     configure_logging("INFO")
-    
+
     # Test with invalid level
     with pytest.raises(ValueError):
         configure_logging("NOT_A_LEVEL")
+
+
+def test_configure_logging_json_format_switches_root_formatter():
+    """When json_format=True, the root logger handler emits JSON Lines."""
+    import io
+    import json as _json
+    import logging as _logging
+
+    configure_logging("INFO", json_format=True)
+    root = _logging.getLogger()
+    handler = next(h for h in root.handlers if isinstance(h, _logging.StreamHandler))
+    saved_stream = handler.stream
+    handler.stream = io.StringIO()
+    try:
+        _logging.getLogger("mailoney.core").info("hello %s", "world")
+        line = handler.stream.getvalue().strip()
+    finally:
+        handler.stream = saved_stream
+        # Restore the default text formatter to avoid leaking JSON config
+        # into other tests.
+        configure_logging("INFO", json_format=False)
+
+    payload = _json.loads(line)
+    assert payload["event"] == "log"
+    assert payload["logger"] == "mailoney.core"
+    assert payload["level"] == "INFO"
+    assert payload["message"] == "hello world"

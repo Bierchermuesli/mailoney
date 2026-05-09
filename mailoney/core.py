@@ -11,7 +11,6 @@ import sys
 import time
 import uuid
 import argparse
-from time import strftime
 from typing import Optional, Tuple, Dict, Any, List
 
 from .db import create_session, update_session_data, log_credential, init_db
@@ -233,9 +232,10 @@ class SMTPHoneypot:
             dest_port=self.bind_port
         )
 
-        # Per-session summary state. We accumulate just enough to render a
-        # single end-of-session record; we no longer keep a per-command
-        # transcript with timestamps.
+        # Per-session summary state. We emit a single end-of-session record
+        # rather than a timestamped per-command transcript: the latter scales
+        # linearly with attacker chattiness and buries the actionable signal
+        # under noise.
         commands: List[str] = []
         credentials: List[str] = []
         mail_info: Optional[Dict[str, Any]] = None
@@ -485,7 +485,11 @@ def parse_args() -> argparse.Namespace:
         '--log-json',
         action='store_true',
         default=get_settings().log_json,
-        help='Emit honeypot events as JSON Lines instead of human-readable text.'
+        help=(
+            'Emit every log line — both honeypot events and operational '
+            'records — as JSON Lines on stdout. Default is human-readable '
+            'text for both.'
+        )
     )
 
     parser.add_argument(
@@ -527,8 +531,10 @@ def run_server() -> None:
     # Parse command-line arguments
     args = parse_args()
     
-    # Configure logging
-    configure_logging(args.log_level)
+    # Configure logging. The same flag drives both the operational
+    # (root) logger and the events logger so the entire stdout stream
+    # is uniformly text or uniformly JSON.
+    configure_logging(args.log_level, json_format=args.log_json)
     events.init_event_logging(json_format=args.log_json)
 
     # Display banner
