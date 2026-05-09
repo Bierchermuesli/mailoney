@@ -136,7 +136,10 @@ When the database is disabled:
   runtime.
 - Per-session events (`session_started`, `credential_captured`,
   `session_ended`) are emitted to the `mailoney.events` logger.
-- In JSON mode, `session_ended` events include the full SMTP transcript.
+- `session_ended` carries a per-session summary — source/destination,
+  duration, command list, last response code, and any captured
+  credentials. Text mode drops the command and credential lists for
+  readability; JSON mode keeps them.
 
 ### Command-line Arguments
 
