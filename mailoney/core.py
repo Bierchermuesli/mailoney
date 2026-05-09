@@ -8,6 +8,7 @@ import logging
 import json
 import sys
 import uuid
+import time
 import argparse
 from time import strftime
 from typing import Optional, Tuple, Dict, Any, List
@@ -191,6 +192,7 @@ class SMTPHoneypot:
         session_uuid = str(uuid.uuid4())
         metrics.CONNECTIONS_TOTAL.inc()
         metrics.ACTIVE_SESSIONS.inc()
+        session_started = time.monotonic()
         session_outcome = "ok"
         session_record = create_session(
             addr[0], addr[1], self.server_name,
@@ -350,6 +352,9 @@ class SMTPHoneypot:
             session_outcome = "error"
         finally:
             metrics.SESSIONS_TOTAL.labels(result=session_outcome).inc()
+            metrics.SESSION_DURATION_SECONDS.observe(time.monotonic() - session_started)
+            if not any(entry.get("direction") == "in" for entry in session_log):
+                metrics.BANNER_ONLY_SESSIONS_TOTAL.inc()
             metrics.ACTIVE_SESSIONS.dec()
             client_socket.close()
             logger.info(f"Connection closed for {addr[0]}:{addr[1]} (dest: {self.bind_ip}:{self.bind_port})")

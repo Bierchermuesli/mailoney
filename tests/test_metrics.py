@@ -11,10 +11,13 @@ from prometheus_client import generate_latest
 from mailoney import metrics
 from mailoney.metrics import (
     ACTIVE_SESSIONS,
+    BANNER_ONLY_SESSIONS_TOTAL,
     COMMANDS_TOTAL,
     CONNECTIONS_TOTAL,
     CREDENTIALS_CAPTURED_TOTAL,
+    SESSION_DURATION_SECONDS,
     SESSIONS_TOTAL,
+    START_TIME_SECONDS,
     classify_command,
     start_metrics_server,
 )
@@ -88,6 +91,30 @@ def test_active_sessions_gauge_inc_dec():
     assert ACTIVE_SESSIONS._value.get() == before
 
 
+def test_banner_only_counter_increments():
+    before = _counter_value(BANNER_ONLY_SESSIONS_TOTAL)
+    BANNER_ONLY_SESSIONS_TOTAL.inc()
+    assert _counter_value(BANNER_ONLY_SESSIONS_TOTAL) == before + 1
+
+
+def test_session_duration_histogram_records_observations():
+    """Observe a few durations and confirm the histogram absorbs them."""
+    before_count = SESSION_DURATION_SECONDS._sum.get()
+    SESSION_DURATION_SECONDS.observe(0.05)
+    SESSION_DURATION_SECONDS.observe(2.5)
+    SESSION_DURATION_SECONDS.observe(120.0)
+    assert SESSION_DURATION_SECONDS._sum.get() == before_count + 0.05 + 2.5 + 120.0
+
+
+def test_start_time_gauge_is_set_at_import():
+    """Sanity: gauge holds a unix timestamp from this process's lifetime."""
+    import time as _time
+    value = START_TIME_SECONDS._value.get()
+    # Set during module import; must be in the past and within the last day.
+    assert 0 < value <= _time.time()
+    assert _time.time() - value < 86400
+
+
 def test_metric_names_appear_in_exposition():
     output = generate_latest().decode()
     assert "mailoney_smtp_connections_total" in output
@@ -95,6 +122,9 @@ def test_metric_names_appear_in_exposition():
     assert "mailoney_smtp_credentials_captured_total" in output
     assert "mailoney_smtp_commands_total" in output
     assert "mailoney_smtp_active_sessions" in output
+    assert "mailoney_smtp_session_duration_seconds" in output
+    assert "mailoney_smtp_banner_only_sessions_total" in output
+    assert "mailoney_start_time_seconds" in output
     assert "mailoney_build_info" in output
 
 
