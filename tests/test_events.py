@@ -1,0 +1,111 @@
+"""
+Tests for the structured event logger.
+"""
+import io
+import json
+import logging
+
+import pytest
+
+from mailoney import events
+
+
+@pytest.fixture
+def capture_events():
+    """Replace the events handler with a stream we can inspect."""
+    stream = io.StringIO()
+    logger = logging.getLogger(events.EVENT_LOGGER_NAME)
+    saved_handlers = list(logger.handlers)
+    saved_propagate = logger.propagate
+    for h in saved_handlers:
+        logger.removeHandler(h)
+    handler = logging.StreamHandler(stream)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        yield stream, handler
+    finally:
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+        for h in saved_handlers:
+            logger.addHandler(h)
+        logger.propagate = saved_propagate
+
+
+def test_text_format_session_started(capture_events):
+    stream, handler = capture_events
+    handler.setFormatter(events.TextEventFormatter())
+
+    events.session_started(
+        session_uuid="abc-123",
+        src_ip="10.0.0.1",
+        src_port=4444,
+        server_name="mail.example.com",
+        dest_ip="10.0.0.2",
+        dest_port=25,
+    )
+
+    out = stream.getvalue()
+    assert "session_started" in out
+    assert "session_uuid=abc-123" in out
+    assert "src_ip=10.0.0.1" in out
+    assert "dest_port=25" in out
+
+
+def test_text_format_drops_transcript(capture_events):
+    stream, handler = capture_events
+    handler.setFormatter(events.TextEventFormatter())
+
+    events.session_ended(
+        session_uuid="abc-123",
+        command_count=2,
+        transcript=[{"direction": "in", "data": "ehlo"}],
+    )
+
+    out = stream.getvalue()
+    assert "session_ended" in out
+    assert "command_count=2" in out
+    # Transcript is bulky and is intentionally omitted in text mode.
+    assert "transcript" not in out
+
+
+def test_json_format_includes_all_fields(capture_events):
+    stream, handler = capture_events
+    handler.setFormatter(events.JsonEventFormatter())
+
+    events.credential_captured("abc-123", "dGVzdDp0ZXN0")
+
+    line = stream.getvalue().strip()
+    payload = json.loads(line)
+    assert payload["event"] == "credential_captured"
+    assert payload["session_uuid"] == "abc-123"
+    assert payload["auth_string"] == "dGVzdDp0ZXN0"
+    assert "ts" in payload
+
+
+def test_json_format_includes_transcript(capture_events):
+    stream, handler = capture_events
+    handler.setFormatter(events.JsonEventFormatter())
+
+    transcript = [{"direction": "in", "data": "ehlo localhost"}]
+    events.session_ended(
+        session_uuid="abc-123",
+        command_count=1,
+        transcript=transcript,
+    )
+
+    payload = json.loads(stream.getvalue().strip())
+    assert payload["event"] == "session_ended"
+    assert payload["transcript"] == transcript
+    assert payload["command_count"] == 1
+
+
+def test_init_event_logging_is_idempotent():
+    """Calling init repeatedly should not stack handlers."""
+    events.init_event_logging(json_format=False)
+    events.init_event_logging(json_format=True)
+    events.init_event_logging(json_format=False)
+    logger = logging.getLogger(events.EVENT_LOGGER_NAME)
+    assert len(logger.handlers) == 1
+    assert logger.propagate is False

@@ -20,11 +20,14 @@ class Settings(BaseSettings):
     bind_port: int = Field(default=25)
     server_name: str = Field(default="mail.example.com")
     
-    # Database settings
+    # Database settings.
+    # An explicitly empty value (MAILONEY_DB_URL=) disables the DB and runs
+    # in event-logging-only mode.
     db_url: str = Field(default="sqlite:///mailoney.db")
-    
+
     # Logging settings
     log_level: str = Field(default="INFO")
+    log_json: bool = Field(default=False)
     
     # Configure the settings to use the MAILONEY_ prefix for environment variables
     model_config = SettingsConfigDict(
