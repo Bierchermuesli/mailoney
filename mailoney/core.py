@@ -3,6 +3,7 @@ Core functionality for the Mailoney SMTP Honeypot
 """
 import re
 import socket
+import ssl
 import threading
 import logging
 import json
@@ -15,6 +16,11 @@ from typing import Optional, Tuple, Dict, Any, List
 from .db import create_session, update_session_data, log_credential, init_db
 from .config import get_settings, configure_logging
 from .mail_storage import store_mail_body
+
+# Seconds to allow for the TLS handshake on STARTTLS. Without this, a
+# malicious peer can stall a worker thread indefinitely by opening a
+# connection and never completing the handshake.
+TLS_HANDSHAKE_TIMEOUT_SECONDS = 10
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +54,8 @@ class SMTPHoneypot:
         server_name: str = 'mail.example.com',
         mail_dir: Optional[str] = None,
         conn_timeout: int = DEFAULT_CONN_TIMEOUT,
+        tls_cert: Optional[str] = None,
+        tls_key: Optional[str] = None,
     ):
         """
         Initialize the SMTP honeypot server.
@@ -65,6 +73,9 @@ class SMTPHoneypot:
                 client that sends nothing for this long is dropped, so a
                 slow-loris client cannot pin a handler thread. A value
                 <= 0 disables the timeout.
+            tls_cert: Path to PEM cert/chain. Both ``tls_cert`` and
+                ``tls_key`` must be provided to enable STARTTLS.
+            tls_key: Path to PEM private key.
         """
         self.bind_ip = bind_ip
         self.bind_port = bind_port
@@ -72,14 +83,48 @@ class SMTPHoneypot:
         self.mail_dir = mail_dir
         self.conn_timeout = conn_timeout
         self.socket = None
-        self.ehlo_response = f'''250 {server_name}
-250-PIPELINING
-250-SIZE 10240000
-250-VRFY
-250-ETRN
-250-STARTTLS
-250-AUTH LOGIN PLAIN
-250 8BITMIME\n'''
+
+        if tls_cert and tls_key:
+            self.tls_context = self._build_tls_context(tls_cert, tls_key)
+        else:
+            self.tls_context = None
+
+        # Pre-TLS EHLO advertises STARTTLS only when we can actually serve
+        # it; post-TLS EHLO (sent after a successful upgrade) drops the
+        # STARTTLS line per RFC 3207 §4.2.
+        capabilities = ["PIPELINING", "SIZE 10240000", "VRFY", "ETRN"]
+        if self.tls_context is not None:
+            capabilities.append("STARTTLS")
+        capabilities.extend(["AUTH LOGIN PLAIN", "8BITMIME"])
+        self.ehlo_response = self._format_ehlo_response(capabilities)
+        self.ehlo_response_post_tls = self._format_ehlo_response(
+            [c for c in capabilities if c != "STARTTLS"]
+        )
+
+    def _format_ehlo_response(self, capabilities: List[str]) -> str:
+        """Render an EHLO response with proper continuation markers.
+
+        All lines except the last use ``250-`` as the prefix; the final
+        line uses ``250 `` (space) per RFC 5321 §4.2.1.
+        """
+        lines = [self.server_name, *capabilities]
+        formatted = []
+        for i, line in enumerate(lines):
+            sep = "-" if i < len(lines) - 1 else " "
+            formatted.append(f"250{sep}{line}")
+        return "\n".join(formatted) + "\n"
+
+    @staticmethod
+    def _build_tls_context(cert_path: str, key_path: str) -> ssl.SSLContext:
+        """Build an SSLContext for STARTTLS upgrades.
+
+        Pinned to TLS 1.2+ (1.0/1.1 are deprecated and offer no upside
+        for a honeypot). Cert and key are loaded once at startup.
+        """
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+        return ctx
         
     def start(self) -> None:
         """
@@ -202,13 +247,14 @@ class SMTPHoneypot:
         # <= 0 leaves the socket in its default blocking mode.
         if self.conn_timeout and self.conn_timeout > 0:
             client_socket.settimeout(self.conn_timeout)
+        tls_active = False
 
         try:
             # Send banner
             banner = f"220 {self.server_name} ESMTP Service Ready\n"
             client_socket.send(banner.encode())
             session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": banner})
-            
+
             # Handle client commands
             error_count = 0
             while error_count < 10:
@@ -216,16 +262,57 @@ class SMTPHoneypot:
                     request = client_socket.recv(4096).decode().strip().lower()
                     if not request:
                         break
-                        
+
                     session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "in", "data": request})
                     logger.debug(f"Client: {request}")
-                    
-                    # Handle EHLO/HELO
+
+                    # Handle EHLO/HELO. Use the post-TLS variant once a
+                    # STARTTLS upgrade has succeeded (no STARTTLS line).
                     if request.startswith('ehlo') or request.startswith('helo'):
-                        client_socket.send(self.ehlo_response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": self.ehlo_response})
-                        error_count = 0  # Reset error count after successful command
-                        
+                        ehlo = self.ehlo_response_post_tls if tls_active else self.ehlo_response
+                        client_socket.send(ehlo.encode())
+                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": ehlo})
+                        error_count = 0
+
+                    # STARTTLS — upgrade the connection in place.
+                    elif request.startswith('starttls'):
+                        if self.tls_context is None:
+                            response = "454 4.7.0 TLS not available\n"
+                            client_socket.send(response.encode())
+                            session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                            error_count += 1
+                        elif tls_active:
+                            response = "503 5.5.1 STARTTLS already active\n"
+                            client_socket.send(response.encode())
+                            session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                            error_count += 1
+                        else:
+                            response = "220 2.0.0 Ready to start TLS\n"
+                            client_socket.send(response.encode())
+                            session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                            try:
+                                client_socket.settimeout(TLS_HANDSHAKE_TIMEOUT_SECONDS)
+                                client_socket = self.tls_context.wrap_socket(
+                                    client_socket,
+                                    server_side=True,
+                                )
+                                # Restore the inactivity timeout the
+                                # handshake temporarily widened. Clearing
+                                # it outright would exempt every upgraded
+                                # connection from slow-loris protection.
+                                client_socket.settimeout(
+                                    self.conn_timeout
+                                    if self.conn_timeout and self.conn_timeout > 0
+                                    else None
+                                )
+                                tls_active = True
+                                session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "tls-upgrade", "tls_version": client_socket.version()})
+                                error_count = 0
+                            except (ssl.SSLError, OSError, socket.timeout) as e:
+                                logger.warning(f"TLS handshake failed for {addr[0]}:{addr[1]}: {e}")
+                                session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "tls-failed", "error": str(e)})
+                                break
+
                     # Handle AUTH
                     elif request.startswith('auth plain'):
                         # Extract auth string
@@ -234,11 +321,11 @@ class SMTPHoneypot:
                             auth_string = parts[2]
                             log_credential(session_record.id, auth_string)
                             logger.info(f"Captured credential: {auth_string}")
-                            
+
                         response = "235 2.7.0 Authentication failed\n"
                         client_socket.send(response.encode())
                         session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
-                        
+
                     # Handle QUIT
                     elif request.startswith('quit'):
                         response = "221 2.0.0 Goodbye\n"
@@ -329,14 +416,17 @@ class SMTPHoneypot:
                 except Exception as e:
                     logger.error(f"Error handling client request: {e}")
                     error_count += 1
-            
+
             # Store the session log
             update_session_data(session_record.id, json.dumps(session_log))
-            
+
         except Exception as e:
             logger.error(f"Error in client handler: {e}")
         finally:
-            client_socket.close()
+            try:
+                client_socket.close()
+            except OSError:
+                pass
             logger.info(f"Connection closed for {addr[0]}:{addr[1]} (dest: {self.bind_ip}:{self.bind_port})")
             
     def stop(self) -> None:
@@ -393,6 +483,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--tls-cert',
+        default=get_settings().tls_cert,
+        help=(
+            'Path to a PEM cert/chain. Both --tls-cert and --tls-key '
+            'must be set to enable STARTTLS.'
+        )
+    )
+
+    parser.add_argument(
         '--conn-timeout',
         type=int,
         default=get_settings().conn_timeout,
@@ -401,6 +500,12 @@ def parse_args() -> argparse.Namespace:
             'sends nothing for this long is dropped, bounding slow-loris '
             'style abuse. 0 disables it. (default: 30)'
         )
+    )
+
+    parser.add_argument(
+        '--tls-key',
+        default=get_settings().tls_key,
+        help='Path to the PEM private key for --tls-cert.'
     )
 
     parser.add_argument(
@@ -451,6 +556,8 @@ def run_server() -> None:
             server_name=args.server_name,
             mail_dir=args.mail_dir,
             conn_timeout=args.conn_timeout,
+            tls_cert=args.tls_cert,
+            tls_key=args.tls_key,
         )
         
         logger.info(f"Starting SMTP Honeypot on {args.ip}:{args.port}")
