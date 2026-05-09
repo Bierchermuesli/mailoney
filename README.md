@@ -115,7 +115,7 @@ python main.py
 | `MAILONEY_SERVER_NAME` | SMTP server name | mail.example.com |
 | `MAILONEY_DB_URL` | Database connection URL. Set to an empty string (`MAILONEY_DB_URL=`) to disable the database and run in event-logging-only mode. | sqlite:///mailoney.db |
 | `MAILONEY_LOG_LEVEL` | Logging level | INFO |
-| `MAILONEY_LOG_JSON` | When `true`, emit honeypot events (session start/end, captured credentials) as JSON Lines on the `mailoney.events` logger. Default emits human-readable text. | false |
+| `MAILONEY_LOG_JSON` | When `true`, every log line on stdout — both honeypot events (session start/end, captured credentials) and operational records (`mailoney.core`, `mailoney.mail_storage`, …) — is emitted as JSON Lines. Default emits human-readable text for both. | false |
 
 ### Running without a database
 

@@ -46,21 +46,47 @@ def get_settings() -> Settings:
     """
     return Settings()
 
-def configure_logging(level: Optional[str] = None) -> None:
+def configure_logging(
+    level: Optional[str] = None,
+    json_format: Optional[bool] = None,
+) -> None:
     """
-    Configure application logging
-    
+    Configure the root logger for operational (non-event) log records.
+
     Args:
-        level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
+        json_format: When True, every operational record is rendered as
+            a JSON Lines object (``{"event": "log", "logger": ...}``).
+            When False or None, records render as human-readable text.
+            Defaults to ``Settings.log_json`` when omitted.
     """
     if level is None:
         level = get_settings().log_level
-        
+    if json_format is None:
+        json_format = get_settings().log_json
+
     numeric_level = getattr(logging, level.upper(), None)
     if not isinstance(numeric_level, int):
         raise ValueError(f"Invalid log level: {level}")
-    
-    logging.basicConfig(
-        level=numeric_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    )
+
+    # Lazy import so events.py stays a leaf module (no config dep).
+    from .events import JsonOperationalFormatter
+
+    root = logging.getLogger()
+    root.setLevel(numeric_level)
+    # Replace any existing StreamHandler (e.g. installed by basicConfig)
+    # so a second call swaps the formatter instead of stacking handlers.
+    for handler in list(root.handlers):
+        if isinstance(handler, logging.StreamHandler):
+            root.removeHandler(handler)
+
+    handler = logging.StreamHandler()
+    if json_format:
+        handler.setFormatter(JsonOperationalFormatter())
+    else:
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            )
+        )
+    root.addHandler(handler)
