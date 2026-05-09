@@ -15,6 +15,7 @@ from typing import Optional, Tuple, Dict, Any, List
 from .db import create_session, update_session_data, log_credential, init_db
 from .config import get_settings, configure_logging
 from .mail_storage import store_mail_body
+from . import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,9 @@ class SMTPHoneypot:
             addr: Client address tuple (ip, port)
         """
         session_uuid = str(uuid.uuid4())
+        metrics.CONNECTIONS_TOTAL.inc()
+        metrics.ACTIVE_SESSIONS.inc()
+        session_outcome = "ok"
         session_record = create_session(
             addr[0], addr[1], self.server_name,
             dest_ip=self.bind_ip,
@@ -219,6 +223,9 @@ class SMTPHoneypot:
                         
                     session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "in", "data": request})
                     logger.debug(f"Client: {request}")
+                    metrics.COMMANDS_TOTAL.labels(
+                        command=metrics.classify_command(request)
+                    ).inc()
                     
                     # Handle EHLO/HELO
                     if request.startswith('ehlo') or request.startswith('helo'):
@@ -232,6 +239,7 @@ class SMTPHoneypot:
                         parts = request.split()
                         if len(parts) >= 3:
                             auth_string = parts[2]
+                            metrics.CREDENTIALS_CAPTURED_TOTAL.inc()
                             log_credential(session_record.id, auth_string)
                             logger.info(f"Captured credential: {auth_string}")
                             
@@ -324,6 +332,10 @@ class SMTPHoneypot:
                     except OSError:
                         pass
                     session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": timeout_reply})
+                    # Distinct from "ok": an idle drop is not a session
+                    # that ran to completion, and operators watching the
+                    # metric want slow-loris pressure to be visible.
+                    session_outcome = "timeout"
                     break
 
                 except Exception as e:
@@ -332,10 +344,13 @@ class SMTPHoneypot:
             
             # Store the session log
             update_session_data(session_record.id, json.dumps(session_log))
-            
+
         except Exception as e:
             logger.error(f"Error in client handler: {e}")
+            session_outcome = "error"
         finally:
+            metrics.SESSIONS_TOTAL.labels(result=session_outcome).inc()
+            metrics.ACTIVE_SESSIONS.dec()
             client_socket.close()
             logger.info(f"Connection closed for {addr[0]}:{addr[1]} (dest: {self.bind_ip}:{self.bind_port})")
             
@@ -410,6 +425,22 @@ def parse_args() -> argparse.Namespace:
         help='Log level'
     )
 
+    parser.add_argument(
+        '--metrics-port',
+        type=int,
+        default=get_settings().metrics_port,
+        help=(
+            'Port to serve Prometheus /metrics on. '
+            'If unset, the metrics endpoint is disabled.'
+        )
+    )
+
+    parser.add_argument(
+        '--metrics-bind',
+        default=get_settings().metrics_bind,
+        help='Bind address for the /metrics endpoint (default: ::, dual-stack)'
+    )
+
     return parser.parse_args()
 
 
@@ -442,7 +473,11 @@ def run_server() -> None:
     # Initialize database
     logger.info(f"Initializing database with URL: {args.db_url}")
     init_db(args.db_url)
-    
+
+    # Start Prometheus /metrics endpoint if requested
+    if args.metrics_port:
+        metrics.start_metrics_server(args.metrics_port, args.metrics_bind)
+
     # Create and start server
     try:
         server = SMTPHoneypot(
