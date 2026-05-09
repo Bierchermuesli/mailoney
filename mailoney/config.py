@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     # Logging settings
     log_level: str = Field(default="INFO")
     log_json: bool = Field(default=False)
+
+    # Prometheus metrics. metrics_port unset (None) disables the /metrics
+    # endpoint. metrics_bind defaults to dual-stack ([::]).
+    metrics_port: Optional[int] = Field(default=None)
+    metrics_bind: str = Field(default="::")
     
     # Configure the settings to use the MAILONEY_ prefix for environment variables
     model_config = SettingsConfigDict(

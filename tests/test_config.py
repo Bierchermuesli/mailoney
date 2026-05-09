@@ -15,6 +15,8 @@ def test_default_settings():
     assert settings.db_url == "sqlite:///mailoney.db"
     assert settings.log_level == "INFO"
     assert settings.log_json is False
+    assert settings.metrics_port is None
+    assert settings.metrics_bind == "::"
 
 
 def test_empty_db_url_env_disables_db(monkeypatch):
@@ -28,6 +30,14 @@ def test_log_json_env(monkeypatch):
     monkeypatch.setenv("MAILONEY_LOG_JSON", "true")
     settings = Settings()
     assert settings.log_json is True
+
+
+def test_metrics_env(monkeypatch):
+    monkeypatch.setenv("MAILONEY_METRICS_PORT", "9025")
+    monkeypatch.setenv("MAILONEY_METRICS_BIND", "127.0.0.1")
+    settings = Settings()
+    assert settings.metrics_port == 9025
+    assert settings.metrics_bind == "127.0.0.1"
 
 def test_env_settings(monkeypatch):
     """Test settings from environment variables"""

@@ -14,6 +14,7 @@ from typing import Optional, Tuple, Dict, Any, List
 from .db import create_session, update_session_data, log_credential, init_db
 from .config import get_settings, configure_logging
 from . import events
+from . import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,9 @@ class SMTPHoneypot:
             addr: Client address tuple (ip, port)
         """
         session_uuid = str(uuid.uuid4())
+        session_outcome = "ok"
+        metrics.CONNECTIONS_TOTAL.inc()
+        metrics.ACTIVE_SESSIONS.inc()
         events.session_started(
             session_uuid=session_uuid,
             src_ip=addr[0],
@@ -111,7 +115,7 @@ class SMTPHoneypot:
             dest_port=self.bind_port
         )
         session_log = []
-        
+
         try:
             # Send banner
             banner = f"220 {self.server_name} ESMTP Service Ready\n"
@@ -128,6 +132,9 @@ class SMTPHoneypot:
                         
                     session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "in", "data": request})
                     logger.debug(f"Client: {request}")
+                    metrics.COMMANDS_TOTAL.labels(
+                        command=metrics.classify_command(request)
+                    ).inc()
                     
                     # Handle EHLO/HELO
                     if request.startswith('ehlo') or request.startswith('helo'):
@@ -141,6 +148,7 @@ class SMTPHoneypot:
                         parts = request.split()
                         if len(parts) >= 3:
                             auth_string = parts[2]
+                            metrics.CREDENTIALS_CAPTURED_TOTAL.inc()
                             events.credential_captured(session_uuid, auth_string)
                             log_credential(session_record.id, auth_string)
                             logger.info(f"Captured credential: {auth_string}")
@@ -181,10 +189,13 @@ class SMTPHoneypot:
                 transcript=session_log,
             )
             update_session_data(session_record.id, json.dumps(session_log))
-            
+
         except Exception as e:
             logger.error(f"Error in client handler: {e}")
+            session_outcome = "error"
         finally:
+            metrics.SESSIONS_TOTAL.labels(result=session_outcome).inc()
+            metrics.ACTIVE_SESSIONS.dec()
             client_socket.close()
             logger.info(f"Connection closed for {addr[0]}:{addr[1]} (dest: {self.bind_ip}:{self.bind_port})")
             
@@ -249,6 +260,22 @@ def parse_args() -> argparse.Namespace:
         help='Emit honeypot events as JSON Lines instead of human-readable text.'
     )
 
+    parser.add_argument(
+        '--metrics-port',
+        type=int,
+        default=get_settings().metrics_port,
+        help=(
+            'Port to serve Prometheus /metrics on. '
+            'If unset, the metrics endpoint is disabled.'
+        )
+    )
+
+    parser.add_argument(
+        '--metrics-bind',
+        default=get_settings().metrics_bind,
+        help='Bind address for the /metrics endpoint (default: ::, dual-stack)'
+    )
+
     return parser.parse_args()
 
 
@@ -285,7 +312,11 @@ def run_server() -> None:
     else:
         logger.info(f"Initializing database with URL: {args.db_url}")
     init_db(args.db_url)
-    
+
+    # Start Prometheus /metrics endpoint if requested
+    if args.metrics_port:
+        metrics.start_metrics_server(args.metrics_port, args.metrics_bind)
+
     # Create and start server
     try:
         server = SMTPHoneypot(

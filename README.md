@@ -116,6 +116,8 @@ python main.py
 | `MAILONEY_DB_URL` | Database connection URL. Set to an empty string (`MAILONEY_DB_URL=`) to disable the database and run in event-logging-only mode. | sqlite:///mailoney.db |
 | `MAILONEY_LOG_LEVEL` | Logging level | INFO |
 | `MAILONEY_LOG_JSON` | When `true`, emit honeypot events (session start/end, captured credentials) as JSON Lines on the `mailoney.events` logger. Default emits human-readable text. | false |
+| `MAILONEY_METRICS_PORT` | Port for the Prometheus `/metrics` endpoint. Unset disables the endpoint. | (unset) |
+| `MAILONEY_METRICS_BIND` | Bind address for the metrics endpoint. Default is dual-stack IPv4+IPv6. | `::` |
 
 ### Running without a database
 
@@ -153,6 +155,8 @@ Available arguments:
 - `-d`, `--db-url`: Database URL. Pass an empty string to disable the database.
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 - `--log-json`: Emit honeypot events as JSON Lines instead of human-readable text.
+- `--metrics-port`: Port for the Prometheus `/metrics` endpoint (unset = disabled)
+- `--metrics-bind`: Bind address for the metrics endpoint (default: `::`)
 
 ### Database Configuration
 
@@ -172,6 +176,32 @@ postgresql://username:password@hostname:port/database
 ```
 mysql+pymysql://username:password@hostname:port/database
 ```
+
+## Prometheus Metrics
+
+Mailoney can expose a `/metrics` endpoint for Prometheus scraping when
+`MAILONEY_METRICS_PORT` is set (or `--metrics-port` is passed). A typical
+deployment:
+
+```bash
+docker run -p 25:25 -p 9025:9025 \
+  -e MAILONEY_METRICS_PORT=9025 \
+  ghcr.io/phin3has/mailoney:latest
+```
+
+Exposed metrics:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `mailoney_smtp_connections_total` | Counter | — | SMTP connections accepted. |
+| `mailoney_smtp_sessions_total` | Counter | `result` (`ok`/`error`) | SMTP sessions that ran to completion. |
+| `mailoney_smtp_credentials_captured_total` | Counter | — | AUTH PLAIN credentials captured. |
+| `mailoney_smtp_commands_total` | Counter | `command` | SMTP commands by verb (`ehlo`, `helo`, `auth`, `mail`, `rcpt`, `data`, `quit`, `unknown`). |
+| `mailoney_smtp_active_sessions` | Gauge | — | Sessions currently in flight. |
+| `mailoney_build_info` | Info | `version` | Mailoney build/version info. |
+
+The endpoint binds dual-stack (`::`) by default. Override with
+`MAILONEY_METRICS_BIND=127.0.0.1` if you want loopback-only.
 
 ## Database Schema
 
