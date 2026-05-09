@@ -113,8 +113,30 @@ python main.py
 | `MAILONEY_BIND_IP` | IP address to bind to | 0.0.0.0 |
 | `MAILONEY_BIND_PORT` | Port to listen on | 25 |
 | `MAILONEY_SERVER_NAME` | SMTP server name | mail.example.com |
-| `MAILONEY_DB_URL` | Database connection URL | sqlite:///mailoney.db |
+| `MAILONEY_DB_URL` | Database connection URL. Set to an empty string (`MAILONEY_DB_URL=`) to disable the database and run in event-logging-only mode. | sqlite:///mailoney.db |
 | `MAILONEY_LOG_LEVEL` | Logging level | INFO |
+| `MAILONEY_LOG_JSON` | When `true`, emit honeypot events (session start/end, captured credentials) as JSON Lines on the `mailoney.events` logger. Default emits human-readable text. | false |
+
+### Running without a database
+
+Mailoney can run as a pure event emitter — useful when you ship logs to a
+SIEM, ELK stack, Loki, etc. and don't want to operate a SQL database just
+for honeypot capture.
+
+```bash
+# DB-less mode, JSON log output suitable for log shippers
+docker run -p 25:25 \
+  -e MAILONEY_DB_URL= \
+  -e MAILONEY_LOG_JSON=true \
+  ghcr.io/phin3has/mailoney:latest
+```
+
+When the database is disabled:
+- No tables are created, no migrations are run, no DB driver is required at
+  runtime.
+- Per-session events (`session_started`, `credential_captured`,
+  `session_ended`) are emitted to the `mailoney.events` logger.
+- In JSON mode, `session_ended` events include the full SMTP transcript.
 
 ### Command-line Arguments
 
@@ -128,8 +150,9 @@ Available arguments:
 - `-i`, `--ip`: IP address to bind to
 - `-p`, `--port`: Port to listen on
 - `-s`, `--server-name`: Server name to display in SMTP responses
-- `-d`, `--db-url`: Database URL
+- `-d`, `--db-url`: Database URL. Pass an empty string to disable the database.
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+- `--log-json`: Emit honeypot events as JSON Lines instead of human-readable text.
 
 ### Database Configuration
 

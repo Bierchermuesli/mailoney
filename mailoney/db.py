@@ -48,20 +48,34 @@ SMTPSession.credentials = relationship("Credential", order_by=Credential.id, bac
 def init_db(db_url: Optional[str] = None) -> None:
     """
     Initialize the database connection.
-    
+
     Args:
-        db_url: Database connection URL. If None, uses MAILONEY_DB_URL environment variable.
+        db_url: Database connection URL.
+            - None: read MAILONEY_DB_URL; if unset entirely, fall back to
+              the legacy default ``sqlite:///mailoney.db``.
+            - "" (empty string): explicit opt-out; the database is disabled
+              and all write helpers become no-ops. Event logging is
+              unaffected.
+            - any other value: SQLAlchemy connection URL.
     """
     global engine, Session
-    
+
     if db_url is None:
-        db_url = os.environ.get("MAILONEY_DB_URL")
-        
-    if not db_url:
-        # Default to SQLite for development
-        db_url = "sqlite:///mailoney.db"
-        logger.warning(f"No database URL provided, using default: {db_url}")
-    
+        env_val = os.environ.get("MAILONEY_DB_URL")
+        # Distinguish "env unset" (legacy default) from "env explicitly empty"
+        # (opt-out). Pydantic settings preserves this distinction; preserve it
+        # here too for callers that bypass settings.
+        if env_val is None:
+            db_url = "sqlite:///mailoney.db"
+        else:
+            db_url = env_val
+
+    if db_url == "":
+        engine = None
+        Session = None
+        logger.info("Database disabled (MAILONEY_DB_URL is empty); events go to logs only")
+        return
+
     logger.info(f"Initializing database with URL: {db_url}")
     
     # For in-memory SQLite, we need to use specific settings
@@ -93,7 +107,6 @@ def init_db(db_url: Optional[str] = None) -> None:
     # Run migrations if not using in-memory DB
     if not is_memory_db:
         try:
-            import os
             from alembic import command
             from alembic.config import Config
             
@@ -109,6 +122,11 @@ def init_db(db_url: Optional[str] = None) -> None:
         except Exception as e:
             logger.warning(f"Error applying migrations: {e}")
 
+def is_db_enabled() -> bool:
+    """Return True if a database connection has been configured."""
+    return Session is not None
+
+
 def create_session(
     ip_address: str,
     port: int,
@@ -119,6 +137,10 @@ def create_session(
     """
     Create a new session record in the database.
 
+    When the database is disabled (``init_db("")``), returns an unpersisted
+    ``SMTPSession`` with ``id=None`` so callers can keep using attribute
+    access without branching on DB state.
+
     Args:
         ip_address: Client IP address (source)
         port: Client port (source)
@@ -127,13 +149,19 @@ def create_session(
         dest_port: Server's bound port (destination)
 
     Returns:
-        The created SMTPSession instance
+        The created SMTPSession instance (unpersisted when DB is disabled).
     """
     global engine, Session
-    
+
     if Session is None:
-        init_db()
-    
+        return SMTPSession(
+            ip_address=ip_address,
+            port=port,
+            server_name=server_name,
+            dest_ip=dest_ip,
+            dest_port=dest_port,
+        )
+
     # First verify that tables exist
     insp = inspect(engine)
     tables = insp.get_table_names()
@@ -174,17 +202,20 @@ def create_session(
     finally:
         db_session.close()
 
-def update_session_data(session_id: int, session_data: str) -> None:
+def update_session_data(session_id: Optional[int], session_data: str) -> None:
     """
     Update session data for an existing session.
-    
+
+    No-op when the database is disabled or ``session_id`` is None
+    (the latter happens when ``create_session`` was called in DB-disabled mode).
+
     Args:
-        session_id: The ID of the session to update
-        session_data: Session data to store
+        session_id: The ID of the session to update.
+        session_data: Session data to store.
     """
-    if Session is None:
-        init_db()
-    
+    if Session is None or session_id is None:
+        return
+
     session = Session()
     try:
         # SQLAlchemy 2.0 style
@@ -202,17 +233,19 @@ def update_session_data(session_id: int, session_data: str) -> None:
     finally:
         session.close()
 
-def log_credential(session_id: int, auth_string: str) -> None:
+def log_credential(session_id: Optional[int], auth_string: str) -> None:
     """
     Log a credential attempt.
-    
+
+    No-op when the database is disabled or ``session_id`` is None.
+
     Args:
-        session_id: The ID of the session
-        auth_string: The authentication string
+        session_id: The ID of the session.
+        auth_string: The authentication string.
     """
-    if Session is None:
-        init_db()
-    
+    if Session is None or session_id is None:
+        return
+
     session = Session()
     try:
         credential = Credential(

@@ -8,12 +8,26 @@ from mailoney.config import get_settings, configure_logging, Settings
 def test_default_settings():
     """Test default settings"""
     settings = get_settings()
-    
+
     assert settings.bind_ip == "0.0.0.0"
     assert settings.bind_port == 25
     assert settings.server_name == "mail.example.com"
     assert settings.db_url == "sqlite:///mailoney.db"
     assert settings.log_level == "INFO"
+    assert settings.log_json is False
+
+
+def test_empty_db_url_env_disables_db(monkeypatch):
+    """An explicit empty MAILONEY_DB_URL means 'no DB', distinct from unset."""
+    monkeypatch.setenv("MAILONEY_DB_URL", "")
+    settings = Settings()
+    assert settings.db_url == ""
+
+
+def test_log_json_env(monkeypatch):
+    monkeypatch.setenv("MAILONEY_LOG_JSON", "true")
+    settings = Settings()
+    assert settings.log_json is True
 
 def test_env_settings(monkeypatch):
     """Test settings from environment variables"""
