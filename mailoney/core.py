@@ -3,6 +3,7 @@ Core functionality for the Mailoney SMTP Honeypot
 """
 import re
 import socket
+import ssl
 import threading
 import logging
 import json
@@ -18,6 +19,11 @@ from .config import get_settings, configure_logging
 from .mail_storage import store_mail_body
 from . import events
 from . import metrics
+
+# Seconds to allow for the TLS handshake on STARTTLS. Without this, a
+# malicious peer can stall a worker thread indefinitely by opening a
+# connection and never completing the handshake.
+TLS_HANDSHAKE_TIMEOUT_SECONDS = 10
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +50,8 @@ class SMTPHoneypot:
         bind_port: int = 25,
         server_name: str = 'mail.example.com',
         mail_dir: Optional[str] = None,
+        tls_cert: Optional[str] = None,
+        tls_key: Optional[str] = None,
     ):
         """
         Initialize the SMTP honeypot server.
@@ -55,20 +63,57 @@ class SMTPHoneypot:
             mail_dir: When set, captured message bodies are written to disk
                 under this directory; the session log records the relative
                 path. When None, bodies stay inline in the session log.
+            tls_cert: Path to PEM cert/chain. Both ``tls_cert`` and
+                ``tls_key`` must be provided to enable STARTTLS.
+            tls_key: Path to PEM private key.
         """
         self.bind_ip = bind_ip
         self.bind_port = bind_port
         self.server_name = server_name
         self.mail_dir = mail_dir
         self.socket = None
-        self.ehlo_response = f'''250 {server_name}
-250-PIPELINING
-250-SIZE 10240000
-250-VRFY
-250-ETRN
-250-STARTTLS
-250-AUTH LOGIN PLAIN
-250 8BITMIME\n'''
+
+        if tls_cert and tls_key:
+            self.tls_context = self._build_tls_context(tls_cert, tls_key)
+        else:
+            self.tls_context = None
+
+        # Pre-TLS EHLO advertises STARTTLS only when we can actually serve
+        # it; post-TLS EHLO (sent after a successful upgrade) drops the
+        # STARTTLS line per RFC 3207 §4.2.
+        capabilities = ["PIPELINING", "SIZE 10240000", "VRFY", "ETRN"]
+        if self.tls_context is not None:
+            capabilities.append("STARTTLS")
+        capabilities.extend(["AUTH LOGIN PLAIN", "8BITMIME"])
+        self.ehlo_response = self._format_ehlo_response(capabilities)
+        self.ehlo_response_post_tls = self._format_ehlo_response(
+            [c for c in capabilities if c != "STARTTLS"]
+        )
+
+    def _format_ehlo_response(self, capabilities: List[str]) -> str:
+        """Render an EHLO response with proper continuation markers.
+
+        All lines except the last use ``250-`` as the prefix; the final
+        line uses ``250 `` (space) per RFC 5321 §4.2.1.
+        """
+        lines = [self.server_name, *capabilities]
+        formatted = []
+        for i, line in enumerate(lines):
+            sep = "-" if i < len(lines) - 1 else " "
+            formatted.append(f"250{sep}{line}")
+        return "\n".join(formatted) + "\n"
+
+    @staticmethod
+    def _build_tls_context(cert_path: str, key_path: str) -> ssl.SSLContext:
+        """Build an SSLContext for STARTTLS upgrades.
+
+        Pinned to TLS 1.2+ (1.0/1.1 are deprecated and offer no upside
+        for a honeypot). Cert and key are loaded once at startup.
+        """
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+        return ctx
         
     def start(self) -> None:
         """
@@ -194,7 +239,9 @@ class SMTPHoneypot:
         commands: List[str] = []
         credentials: List[str] = []
         mail_info: Optional[Dict[str, Any]] = None
+        tls_info: Optional[Dict[str, Any]] = None
         last_response_code: Optional[int] = None
+        tls_active = False
 
         def send(response: str) -> None:
             nonlocal last_response_code
@@ -221,10 +268,39 @@ class SMTPHoneypot:
                         command=metrics.classify_command(request)
                     ).inc()
 
-                    # EHLO/HELO
+                    # EHLO/HELO. Post-TLS variant drops STARTTLS per RFC 3207 §4.2.
                     if request.startswith('ehlo') or request.startswith('helo'):
-                        send(self.ehlo_response)
+                        send(self.ehlo_response_post_tls if tls_active else self.ehlo_response)
                         error_count = 0
+
+                    # STARTTLS — upgrade the connection in place.
+                    elif request.startswith('starttls'):
+                        if self.tls_context is None:
+                            send("454 4.7.0 TLS not available\n")
+                            error_count += 1
+                        elif tls_active:
+                            send("503 5.5.1 STARTTLS already active\n")
+                            error_count += 1
+                        else:
+                            send("220 2.0.0 Ready to start TLS\n")
+                            try:
+                                client_socket.settimeout(TLS_HANDSHAKE_TIMEOUT_SECONDS)
+                                client_socket = self.tls_context.wrap_socket(
+                                    client_socket,
+                                    server_side=True,
+                                )
+                                client_socket.settimeout(None)
+                                tls_active = True
+                                tls_info = {
+                                    "active": True,
+                                    "version": client_socket.version(),
+                                    "cipher": client_socket.cipher()[0] if client_socket.cipher() else None,
+                                }
+                                error_count = 0
+                            except (ssl.SSLError, OSError, socket.timeout) as e:
+                                logger.warning(f"TLS handshake failed for {addr[0]}:{addr[1]}: {e}")
+                                tls_info = {"active": False, "error": str(e)}
+                                break
 
                     # AUTH PLAIN
                     elif request.startswith('auth plain'):
@@ -309,6 +385,8 @@ class SMTPHoneypot:
                 summary["credentials"] = credentials
             if mail_info is not None:
                 summary["mail"] = mail_info
+            if tls_info is not None:
+                summary["tls"] = tls_info
 
             events.session_ended(session_uuid=session_uuid, summary=summary)
             update_session_data(session_record.id, json.dumps(summary))
@@ -318,7 +396,10 @@ class SMTPHoneypot:
             if not commands:
                 metrics.BANNER_ONLY_SESSIONS_TOTAL.inc()
             metrics.ACTIVE_SESSIONS.dec()
-            client_socket.close()
+            try:
+                client_socket.close()
+            except OSError:
+                pass
             logger.info(f"Connection closed for {addr[0]}:{addr[1]} (dest: {self.bind_ip}:{self.bind_port})")
             
     def stop(self) -> None:
@@ -376,6 +457,21 @@ def parse_args() -> argparse.Namespace:
             'as <YYYY-MM-DD>/<src-ip>/<session>.eml. '
             'When unset, bodies stay inline in the session log.'
         )
+    )
+
+    parser.add_argument(
+        '--tls-cert',
+        default=get_settings().tls_cert,
+        help=(
+            'Path to a PEM cert/chain. Both --tls-cert and --tls-key '
+            'must be set to enable STARTTLS.'
+        )
+    )
+
+    parser.add_argument(
+        '--tls-key',
+        default=get_settings().tls_key,
+        help='Path to the PEM private key for --tls-cert.'
     )
 
     parser.add_argument(
@@ -456,6 +552,8 @@ def run_server() -> None:
             bind_port=args.port,
             server_name=args.server_name,
             mail_dir=args.mail_dir,
+            tls_cert=args.tls_cert,
+            tls_key=args.tls_key,
         )
         
         logger.info(f"Starting SMTP Honeypot on {args.ip}:{args.port}")
