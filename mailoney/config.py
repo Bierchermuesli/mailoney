@@ -22,7 +22,12 @@ class Settings(BaseSettings):
     
     # Database settings
     db_url: str = Field(default="sqlite:///mailoney.db")
-    
+
+    # STARTTLS. Both must be set to enable TLS upgrade. Paths are read
+    # once at process start; restart the container after cert renewal.
+    tls_cert: Optional[str] = Field(default=None)
+    tls_key: Optional[str] = Field(default=None)
+
     # Logging settings
     log_level: str = Field(default="INFO")
     

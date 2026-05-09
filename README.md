@@ -114,6 +114,8 @@ python main.py
 | `MAILONEY_BIND_PORT` | Port to listen on | 25 |
 | `MAILONEY_SERVER_NAME` | SMTP server name | mail.example.com |
 | `MAILONEY_DB_URL` | Database connection URL | sqlite:///mailoney.db |
+| `MAILONEY_TLS_CERT` | Path to a PEM cert/chain. Both `MAILONEY_TLS_CERT` and `MAILONEY_TLS_KEY` must be set to enable STARTTLS. | (unset) |
+| `MAILONEY_TLS_KEY` | Path to the PEM private key matching `MAILONEY_TLS_CERT`. | (unset) |
 | `MAILONEY_LOG_LEVEL` | Logging level | INFO |
 
 ### Command-line Arguments
@@ -129,6 +131,8 @@ Available arguments:
 - `-p`, `--port`: Port to listen on
 - `-s`, `--server-name`: Server name to display in SMTP responses
 - `-d`, `--db-url`: Database URL
+- `--tls-cert`: Path to a PEM cert/chain (enables STARTTLS together with --tls-key)
+- `--tls-key`: Path to the PEM private key matching --tls-cert
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 
 ### Database Configuration
@@ -149,6 +153,30 @@ postgresql://username:password@hostname:port/database
 ```
 mysql+pymysql://username:password@hostname:port/database
 ```
+
+## STARTTLS
+
+Mailoney supports the SMTP `STARTTLS` extension when both
+`MAILONEY_TLS_CERT` and `MAILONEY_TLS_KEY` are set:
+
+```bash
+docker run -p 25:25 \
+  -e MAILONEY_TLS_CERT=/etc/letsencrypt/live/mx.example.com/fullchain.pem \
+  -e MAILONEY_TLS_KEY=/etc/letsencrypt/live/mx.example.com/privkey.pem \
+  -v /etc/letsencrypt:/etc/letsencrypt:ro \
+  ghcr.io/phin3has/mailoney:latest
+```
+
+When configured:
+- The `EHLO` response advertises `STARTTLS`. After a successful upgrade,
+  the post-TLS `EHLO` drops the line per RFC 3207 §4.2.
+- The handshake is pinned to TLS 1.2 minimum.
+- A 10-second handshake timeout protects against half-open clients.
+- Cert and key are loaded once at process start. Restart the container
+  after a certbot renewal to pick up the new cert.
+
+When unconfigured, `EHLO` does not advertise `STARTTLS`, and an explicit
+`STARTTLS` command from a client gets `454 4.7.0 TLS not available`.
 
 ## Database Schema
 
