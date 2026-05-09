@@ -7,9 +7,9 @@ import threading
 import logging
 import json
 import sys
+import time
 import uuid
 import argparse
-from time import strftime
 from typing import Optional, Tuple, Dict, Any, List
 
 from .db import create_session, update_session_data, log_credential, init_db
@@ -202,7 +202,6 @@ class SMTPHoneypot:
             dest_ip=self.bind_ip,
             dest_port=self.bind_port
         )
-        session_log = []
 
         # Bound the lifetime of an idle connection. With a timeout set,
         # recv()/send() raise socket.timeout after this many seconds of
@@ -212,12 +211,31 @@ class SMTPHoneypot:
         if self.conn_timeout and self.conn_timeout > 0:
             client_socket.settimeout(self.conn_timeout)
 
+        # Per-session summary state. We emit a single end-of-session record
+        # rather than a timestamped per-command transcript: the latter scales
+        # linearly with attacker chattiness and buries the actionable signal
+        # under noise.
+        commands: List[str] = []
+        credentials: List[str] = []
+        # One entry per DATA body received: size, truncation, and the
+        # on-disk path when MAIL_DIR is set. Carried on the summary so the
+        # record survives with the DB disabled.
+        mail: List[Dict[str, Any]] = []
+        last_response_code: Optional[int] = None
+        timed_out = False
+        session_started_at = time.monotonic()
+
+        def send(response: str) -> None:
+            nonlocal last_response_code
+            client_socket.send(response.encode())
+            try:
+                last_response_code = int(response[:3])
+            except ValueError:
+                pass
+
         try:
-            # Send banner
-            banner = f"220 {self.server_name} ESMTP Service Ready\n"
-            client_socket.send(banner.encode())
-            session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": banner})
-            
+            send(f"220 {self.server_name} ESMTP Service Ready\n")
+
             # Handle client commands
             error_count = 0
             while error_count < 10:
@@ -225,56 +243,44 @@ class SMTPHoneypot:
                     request = client_socket.recv(4096).decode().strip().lower()
                     if not request:
                         break
-                        
-                    session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "in", "data": request})
+
+                    commands.append(request)
                     logger.debug(f"Client: {request}")
-                    
-                    # Handle EHLO/HELO
+
+                    # EHLO / HELO
                     if request.startswith('ehlo') or request.startswith('helo'):
-                        client_socket.send(self.ehlo_response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": self.ehlo_response})
-                        error_count = 0  # Reset error count after successful command
-                        
-                    # Handle AUTH
+                        send(self.ehlo_response)
+                        error_count = 0
+
+                    # AUTH PLAIN
                     elif request.startswith('auth plain'):
-                        # Extract auth string
                         parts = request.split()
                         if len(parts) >= 3:
                             auth_string = parts[2]
+                            credentials.append(auth_string)
                             events.credential_captured(session_uuid, auth_string)
                             log_credential(session_record.id, auth_string)
                             logger.info(f"Captured credential: {auth_string}")
-                            
-                        response = "235 2.7.0 Authentication failed\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
-                        
-                    # Handle QUIT
+                        send("235 2.7.0 Authentication failed\n")
+
+                    # QUIT
                     elif request.startswith('quit'):
-                        response = "221 2.0.0 Goodbye\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                        send("221 2.0.0 Goodbye\n")
                         break
-                        
+
                     # MAIL FROM: / RCPT TO: — accept envelope, no body involved.
                     elif request.startswith(('mail from:', 'rcpt to:')):
-                        response = "250 2.1.0 OK\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                        send("250 2.1.0 OK\n")
                         error_count = 0
 
                     # DATA — enter body-receive mode, read until terminator
                     # or size cap, then return to command mode.
                     elif request.startswith('data'):
-                        invitation = "354 End data with <CR><LF>.<CR><LF>\n"
-                        client_socket.send(invitation.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": invitation})
+                        send("354 End data with <CR><LF>.<CR><LF>\n")
 
                         body, terminator_found = self._receive_mail_body(client_socket.recv)
 
                         body_entry: Dict[str, Any] = {
-                            "timestamp": strftime("%Y-%m-%d %H:%M:%S"),
-                            "direction": "mail-body",
                             "size": len(body),
                             "truncated": not terminator_found,
                         }
@@ -290,14 +296,14 @@ class SMTPHoneypot:
                                 # record; do NOT inline the body bytes here —
                                 # if the operator set MAIL_DIR they
                                 # explicitly chose not to keep bodies in the
-                                # log/DB stream, and an error path should not
-                                # silently override that.
+                                # log/event stream, and an error path should
+                                # not silently override that.
                                 logger.error(f"Failed to write mail body: {e}")
                                 body_entry["body_path_error"] = str(e)
                         # If self.mail_dir is unset, only metadata (size,
                         # truncated) is retained. Operators opt in to body
                         # retention by setting MAIL_DIR.
-                        session_log.append(body_entry)
+                        mail.append(body_entry)
 
                         if terminator_found:
                             response = "250 2.0.0 Ok\n"
@@ -307,19 +313,16 @@ class SMTPHoneypot:
                             # Peer closed mid-body. Connection is effectively gone;
                             # send a polite close and break.
                             response = "421 4.4.2 Connection closed\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                        send(response)
                         if not terminator_found:
                             break
                         error_count = 0
 
                     # Unknown command
                     else:
-                        response = "502 5.5.2 Error: command not recognized\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                        send("502 5.5.2 Error: command not recognized\n")
                         error_count += 1
-                        
+
                 except socket.timeout:
                     # Idle longer than conn_timeout. Drop the connection
                     # so the handler thread is freed; the 421 reply is
@@ -328,29 +331,41 @@ class SMTPHoneypot:
                         f"Connection from {addr[0]}:{addr[1]} timed out after "
                         f"{self.conn_timeout}s of inactivity"
                     )
-                    timeout_reply = "421 4.4.2 Connection timed out\n"
+                    timed_out = True
                     try:
-                        client_socket.send(timeout_reply.encode())
+                        send("421 4.4.2 Connection timed out\n")
                     except OSError:
                         pass
-                    session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": timeout_reply})
                     break
 
                 except Exception as e:
                     logger.error(f"Error handling client request: {e}")
                     error_count += 1
-            
-            # Emit session-end event (always) and persist transcript (DB only).
-            events.session_ended(
-                session_uuid=session_uuid,
-                command_count=len(session_log),
-                transcript=session_log,
-            )
-            update_session_data(session_record.id, json.dumps(session_log))
-            
+
         except Exception as e:
             logger.error(f"Error in client handler: {e}")
         finally:
+            duration = time.monotonic() - session_started_at
+            summary: Dict[str, Any] = {
+                "src_ip": addr[0],
+                "src_port": addr[1],
+                "dest_ip": self.bind_ip,
+                "dest_port": self.bind_port,
+                "duration_seconds": round(duration, 3),
+                "command_count": len(commands),
+                "commands": commands,
+                "last_response_code": last_response_code,
+            }
+            if credentials:
+                summary["credentials"] = credentials
+            if mail:
+                summary["mail"] = mail
+            if timed_out:
+                summary["timed_out"] = True
+
+            events.session_ended(session_uuid=session_uuid, summary=summary)
+            update_session_data(session_record.id, json.dumps(summary))
+
             client_socket.close()
             logger.info(f"Connection closed for {addr[0]}:{addr[1]} (dest: {self.bind_ip}:{self.bind_port})")
             
