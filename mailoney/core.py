@@ -187,14 +187,26 @@ class SMTPHoneypot:
             dest_ip=self.bind_ip,
             dest_port=self.bind_port
         )
-        session_log = []
+
+        # Per-session summary state. We accumulate just enough to render a
+        # single end-of-session record; we no longer keep a per-command
+        # transcript with timestamps.
+        commands: List[str] = []
+        credentials: List[str] = []
+        mail_info: Optional[Dict[str, Any]] = None
+        last_response_code: Optional[int] = None
+
+        def send(response: str) -> None:
+            nonlocal last_response_code
+            client_socket.send(response.encode())
+            try:
+                last_response_code = int(response[:3])
+            except ValueError:
+                pass
 
         try:
-            # Send banner
-            banner = f"220 {self.server_name} ESMTP Service Ready\n"
-            client_socket.send(banner.encode())
-            session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": banner})
-            
+            send(f"220 {self.server_name} ESMTP Service Ready\n")
+
             # Handle client commands
             error_count = 0
             while error_count < 10:
@@ -202,118 +214,108 @@ class SMTPHoneypot:
                     request = client_socket.recv(4096).decode().strip().lower()
                     if not request:
                         break
-                        
-                    session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "in", "data": request})
+
+                    commands.append(request)
                     logger.debug(f"Client: {request}")
                     metrics.COMMANDS_TOTAL.labels(
                         command=metrics.classify_command(request)
                     ).inc()
-                    
-                    # Handle EHLO/HELO
+
+                    # EHLO/HELO
                     if request.startswith('ehlo') or request.startswith('helo'):
-                        client_socket.send(self.ehlo_response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": self.ehlo_response})
-                        error_count = 0  # Reset error count after successful command
-                        
-                    # Handle AUTH
+                        send(self.ehlo_response)
+                        error_count = 0
+
+                    # AUTH PLAIN
                     elif request.startswith('auth plain'):
-                        # Extract auth string
                         parts = request.split()
                         if len(parts) >= 3:
                             auth_string = parts[2]
+                            credentials.append(auth_string)
                             metrics.CREDENTIALS_CAPTURED_TOTAL.inc()
                             events.credential_captured(session_uuid, auth_string)
                             log_credential(session_record.id, auth_string)
                             logger.info(f"Captured credential: {auth_string}")
-                            
-                        response = "235 2.7.0 Authentication failed\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
-                        
-                    # Handle QUIT
+                        send("235 2.7.0 Authentication failed\n")
+
+                    # QUIT
                     elif request.startswith('quit'):
-                        response = "221 2.0.0 Goodbye\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                        send("221 2.0.0 Goodbye\n")
                         break
-                        
+
                     # MAIL FROM: / RCPT TO: — accept envelope, no body involved.
                     elif request.startswith(('mail from:', 'rcpt to:')):
-                        response = "250 2.1.0 OK\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                        send("250 2.1.0 OK\n")
                         error_count = 0
 
                     # DATA — enter body-receive mode, read until terminator
                     # or size cap, then return to command mode.
                     elif request.startswith('data'):
-                        invitation = "354 End data with <CR><LF>.<CR><LF>\n"
-                        client_socket.send(invitation.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": invitation})
-
+                        send("354 End data with <CR><LF>.<CR><LF>\n")
                         body, terminator_found = self._receive_mail_body(client_socket.recv)
 
-                        body_entry: Dict[str, Any] = {
-                            "timestamp": strftime("%Y-%m-%d %H:%M:%S"),
-                            "direction": "mail-body",
+                        mail_info = {
                             "size": len(body),
                             "truncated": not terminator_found,
                         }
                         if self.mail_dir:
                             try:
-                                rel_path = store_mail_body(
+                                mail_info["body_path"] = store_mail_body(
                                     self.mail_dir, addr[0], session_uuid, body,
                                 )
-                                body_entry["body_path"] = rel_path
                             except OSError as e:
                                 logger.error(f"Failed to write mail body: {e}")
                                 # Fall back to inline so we don't lose the data.
-                                body_entry["data"] = body.decode("utf-8", errors="replace")
-                                body_entry["body_path_error"] = str(e)
+                                mail_info["data"] = body.decode("utf-8", errors="replace")
+                                mail_info["body_path_error"] = str(e)
                         else:
-                            body_entry["data"] = body.decode("utf-8", errors="replace")
-                        session_log.append(body_entry)
+                            mail_info["data"] = body.decode("utf-8", errors="replace")
 
                         if terminator_found:
-                            response = "250 2.0.0 Ok\n"
+                            send("250 2.0.0 Ok\n")
                         elif len(body) >= MAX_MAIL_BODY_BYTES:
-                            response = "552 5.3.4 Message size limit exceeded\n"
+                            send("552 5.3.4 Message size limit exceeded\n")
                         else:
-                            # Peer closed mid-body. Connection is effectively gone;
-                            # send a polite close and break.
-                            response = "421 4.4.2 Connection closed\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
-                        if not terminator_found:
+                            send("421 4.4.2 Connection closed\n")
                             break
                         error_count = 0
 
                     # Unknown command
                     else:
-                        response = "502 5.5.2 Error: command not recognized\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                        send("502 5.5.2 Error: command not recognized\n")
                         error_count += 1
-                        
+
                 except Exception as e:
                     logger.error(f"Error handling client request: {e}")
                     error_count += 1
-            
-            # Emit session-end event (always) and persist transcript (DB only).
-            events.session_ended(
-                session_uuid=session_uuid,
-                command_count=len(session_log),
-                transcript=session_log,
-            )
-            update_session_data(session_record.id, json.dumps(session_log))
 
         except Exception as e:
             logger.error(f"Error in client handler: {e}")
             session_outcome = "error"
         finally:
+            duration = time.monotonic() - session_started
+            summary: Dict[str, Any] = {
+                "src_ip": addr[0],
+                "src_port": addr[1],
+                "dest_ip": self.bind_ip,
+                "dest_port": self.bind_port,
+                "duration_seconds": round(duration, 3),
+                "command_count": len(commands),
+                "commands": commands,
+                "last_response_code": last_response_code,
+                "outcome": session_outcome,
+            }
+            if credentials:
+                summary["credentials"] = credentials
+            if mail_info is not None:
+                summary["mail"] = mail_info
+
+            events.session_ended(session_uuid=session_uuid, summary=summary)
+            update_session_data(session_record.id, json.dumps(summary))
+
             metrics.SESSIONS_TOTAL.labels(result=session_outcome).inc()
-            metrics.SESSION_DURATION_SECONDS.observe(time.monotonic() - session_started)
-            if not any(entry.get("direction") == "in" for entry in session_log):
+            metrics.SESSION_DURATION_SECONDS.observe(duration)
+            if not commands:
                 metrics.BANNER_ONLY_SESSIONS_TOTAL.inc()
             metrics.ACTIVE_SESSIONS.dec()
             client_socket.close()

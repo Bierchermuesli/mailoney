@@ -53,21 +53,33 @@ def test_text_format_session_started(capture_events):
     assert "dest_port=25" in out
 
 
-def test_text_format_drops_transcript(capture_events):
+def test_text_format_session_ended_summary_flat(capture_events):
+    """Summary fields are flattened to top-level k=v in text mode."""
     stream, handler = capture_events
     handler.setFormatter(events.TextEventFormatter())
 
     events.session_ended(
         session_uuid="abc-123",
-        command_count=2,
-        transcript=[{"direction": "in", "data": "ehlo"}],
+        summary={
+            "src_ip": "10.0.0.1",
+            "duration_seconds": 1.234,
+            "command_count": 3,
+            "commands": ["ehlo", "mail from:<a@b>", "quit"],
+            "credentials": ["dGVzdA=="],
+            "last_response_code": 221,
+        },
     )
 
     out = stream.getvalue()
     assert "session_ended" in out
-    assert "command_count=2" in out
-    # Transcript is bulky and is intentionally omitted in text mode.
-    assert "transcript" not in out
+    assert "src_ip=10.0.0.1" in out
+    assert "duration_seconds=1.234" in out
+    assert "last_response_code=221" in out
+    assert "command_count=3" in out
+    # Bulky nested fields are dropped from text mode for readability.
+    assert "commands=" not in out
+    assert "credentials=" not in out
+    assert "mail=" not in out
 
 
 def test_json_format_includes_all_fields(capture_events):
@@ -84,21 +96,33 @@ def test_json_format_includes_all_fields(capture_events):
     assert "ts" in payload
 
 
-def test_json_format_includes_transcript(capture_events):
+def test_json_format_session_ended_summary_flattened(capture_events):
+    """Summary fields appear at the top level in JSON mode."""
     stream, handler = capture_events
     handler.setFormatter(events.JsonEventFormatter())
 
-    transcript = [{"direction": "in", "data": "ehlo localhost"}]
-    events.session_ended(
-        session_uuid="abc-123",
-        command_count=1,
-        transcript=transcript,
-    )
+    summary = {
+        "src_ip": "10.0.0.1",
+        "duration_seconds": 1.234,
+        "command_count": 3,
+        "commands": ["ehlo localhost", "mail from:<a@b>", "quit"],
+        "credentials": ["dGVzdA=="],
+        "last_response_code": 221,
+        "mail": {"size": 42, "body_path": "2026-05-09/10.0.0.1/abc.eml"},
+    }
+    events.session_ended(session_uuid="abc-123", summary=summary)
 
     payload = json.loads(stream.getvalue().strip())
     assert payload["event"] == "session_ended"
-    assert payload["transcript"] == transcript
-    assert payload["command_count"] == 1
+    assert payload["session_uuid"] == "abc-123"
+    # Summary is flattened, not nested under a 'summary' key.
+    assert "summary" not in payload
+    assert payload["src_ip"] == "10.0.0.1"
+    assert payload["duration_seconds"] == 1.234
+    assert payload["commands"] == summary["commands"]
+    assert payload["credentials"] == summary["credentials"]
+    assert payload["last_response_code"] == 221
+    assert payload["mail"] == summary["mail"]
 
 
 def test_init_event_logging_is_idempotent():

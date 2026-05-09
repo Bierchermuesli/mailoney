@@ -6,8 +6,10 @@ capture). Records flow through a dedicated `mailoney.events` logger so
 operators can route them independently of operational logs.
 
 Output format is controlled by `init_event_logging(json_format=...)`:
-  - text (default): one-line `<ts> <event> k=v ...` summary
-  - JSON Lines: one JSON object per event, including the full transcript
+  - text (default): one-line `<ts> <event> k=v ...` summary; bulky
+    nested fields (commands list, captured credentials, mail body
+    contents) are omitted to keep the line readable.
+  - JSON Lines: one JSON object per event, including all fields.
 
 Events always emit; the database is a separate, optional sink.
 """
@@ -33,18 +35,36 @@ class JsonEventFormatter(logging.Formatter):
             "ts": _record_iso_timestamp(record),
             "event": getattr(record, "event_type", record.getMessage()),
         }
-        data.update(getattr(record, "event_data", {}) or {})
+        event_data = getattr(record, "event_data", {}) or {}
+        # Flatten a nested ``summary`` field so all summary keys live at
+        # the top level of the JSON Lines record. Keeps queries flat.
+        summary = event_data.get("summary")
+        if isinstance(summary, dict):
+            for k, v in event_data.items():
+                if k != "summary":
+                    data[k] = v
+            data.update(summary)
+        else:
+            data.update(event_data)
         return json.dumps(data, default=str)
 
 
 class TextEventFormatter(logging.Formatter):
-    """Human-readable single line. Drops bulky fields (e.g. transcript)."""
+    """Human-readable single line. Drops bulky fields."""
 
-    _SKIP_IN_TEXT = {"transcript"}
+    # Top-level fields whose values can be large (lists, nested dicts) and
+    # would blow up the single-line text format. JSON mode keeps them.
+    _SKIP_IN_TEXT = {"commands", "credentials", "mail", "transcript"}
 
     def format(self, record: logging.LogRecord) -> str:
         event_type = getattr(record, "event_type", record.getMessage())
         data = dict(getattr(record, "event_data", {}) or {})
+        # Flatten a nested summary into top-level k=v pairs for readability,
+        # then drop bulky nested fields from that flat view.
+        summary = data.pop("summary", None)
+        if isinstance(summary, dict):
+            for k, v in summary.items():
+                data.setdefault(k, v)
         for key in self._SKIP_IN_TEXT:
             data.pop(key, None)
         ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime(
@@ -99,12 +119,18 @@ def credential_captured(session_uuid: str, auth_string: str) -> None:
 
 def session_ended(
     session_uuid: str,
-    command_count: int,
-    transcript: list,
+    summary: Dict[str, Any],
 ) -> None:
+    """Emit a session-end event.
+
+    ``summary`` is a flat dict carrying the per-session record (src/dest,
+    duration, command list, last response code, captured credentials,
+    optional mail body reference). In JSON mode all summary fields appear
+    at the top level of the event; in text mode bulky nested fields
+    (commands, credentials, mail) are dropped for readability.
+    """
     emit_event(
         "session_ended",
         session_uuid=session_uuid,
-        command_count=command_count,
-        transcript=transcript,
+        summary=summary,
     )
