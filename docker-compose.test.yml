@@ -1,0 +1,46 @@
+# Test compose for the `deploy` branch.
+#
+# Exercises both new features end-to-end:
+#   * DB-disabled mode (MAILONEY_DB_URL=) with JSON event logs
+#   * Prometheus /metrics endpoint scraped by a real Prometheus container
+#
+# Run:    docker compose -f docker-compose.test.yml up --build
+# Stop:   docker compose -f docker-compose.test.yml down
+#
+# Then:
+#   * SMTP:        telnet localhost 2525   (or:  swaks --to a@b --server localhost:2525)
+#   * /metrics:    curl http://localhost:9025/metrics
+#   * Prometheus:  http://localhost:9090   (try query `mailoney_smtp_connections_total`)
+#   * Logs:        docker compose -f docker-compose.test.yml logs -f mailoney
+
+services:
+  mailoney:
+    build: .
+    restart: unless-stopped
+    ports:
+      # Host port 25 needs root; map to 2525 for friction-free local testing.
+      - "2525:25"
+      # Prometheus /metrics endpoint
+      - "9025:9025"
+    environment:
+      MAILONEY_BIND_IP: "0.0.0.0"
+      MAILONEY_BIND_PORT: "25"
+      MAILONEY_SERVER_NAME: mail.example.com
+      MAILONEY_LOG_LEVEL: INFO
+      # The Dockerfile bakes in MAILONEY_DB_URL=sqlite:///... — explicitly
+      # override to empty here so the DB is disabled and we exercise the
+      # event-logging-only path.
+      MAILONEY_DB_URL: ""
+      MAILONEY_LOG_JSON: "true"
+      MAILONEY_METRICS_PORT: "9025"
+      MAILONEY_METRICS_BIND: "::"
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.test.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - mailoney
