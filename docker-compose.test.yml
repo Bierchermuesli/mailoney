@@ -1,16 +1,17 @@
 # Test compose for the `deploy` branch.
 #
-# Exercises both new features end-to-end:
+# Exercises the deploy-branch features end-to-end:
 #   * DB-disabled mode (MAILONEY_DB_URL=) with JSON event logs
-#   * Prometheus /metrics endpoint scraped by a real Prometheus container
+#   * Prometheus /metrics endpoint
+#   * SMTP DATA phase capture writing .eml files to ./mail-capture/
 #
 # Run:    docker compose -f docker-compose.test.yml up --build
 # Stop:   docker compose -f docker-compose.test.yml down
 #
 # Then:
-#   * SMTP:        telnet localhost 2525   (or:  swaks --to a@b --server localhost:2525)
+#   * SMTP:        telnet localhost 2525   (or:  swaks --to a@b --server localhost:2525 --body "test")
 #   * /metrics:    curl http://localhost:9025/metrics
-#   * Prometheus:  http://localhost:9090   (try query `mailoney_smtp_connections_total`)
+#   * Captured:    ls -R ./mail-capture/
 #   * Logs:        docker compose -f docker-compose.test.yml logs -f mailoney
 
 services:
@@ -22,6 +23,15 @@ services:
       - "2525:25"
       # Prometheus /metrics endpoint
       - "9025:9025"
+    # Inside the container the mailoney user owns /var/lib/mailoney/mail.
+    # Docker creates the host bind-mount target as root on first run; if
+    # writes fail with EACCES, run:
+    #   mkdir -p ./mail-capture && chmod 0777 ./mail-capture
+    # before `up`, or override with `user: "${UID}:${GID}"`.
+    volumes:
+      # Captured mail bodies land on the host under ./mail-capture/.
+      # Layout: <YYYY-MM-DD>/<src-ip>/<session-uuid>.eml
+      - ./mail-capture:/var/lib/mailoney/mail
     environment:
       # Note: bare '::' (no brackets). Brackets are URL syntax, not the
       # bind-address form that socket.bind() / create_server() expect.
@@ -36,3 +46,4 @@ services:
       MAILONEY_LOG_JSON: "true"
       MAILONEY_METRICS_PORT: "9025"
       MAILONEY_METRICS_BIND: "::"
+      MAILONEY_MAIL_DIR: /var/lib/mailoney/mail

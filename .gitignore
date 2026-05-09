@@ -52,3 +52,6 @@ logs/
 # Claude Code
 .claude/
 CLAUDE*.md
+
+# Captured mail bodies from docker-compose.test.yml bind mount
+mail-capture/
