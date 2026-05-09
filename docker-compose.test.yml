@@ -23,7 +23,9 @@ services:
       # Prometheus /metrics endpoint
       - "9025:9025"
     environment:
-      MAILONEY_BIND_IP: "0.0.0.0"
+      # Note: bare '::' (no brackets). Brackets are URL syntax, not the
+      # bind-address form that socket.bind() / create_server() expect.
+      MAILONEY_BIND_IP: "::"
       MAILONEY_BIND_PORT: "25"
       MAILONEY_SERVER_NAME: mail.example.com
       MAILONEY_LOG_LEVEL: INFO
@@ -34,13 +36,3 @@ services:
       MAILONEY_LOG_JSON: "true"
       MAILONEY_METRICS_PORT: "9025"
       MAILONEY_METRICS_BIND: "::"
-
-  prometheus:
-    image: prom/prometheus:latest
-    restart: unless-stopped
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.test.yml:/etc/prometheus/prometheus.yml:ro
-    depends_on:
-      - mailoney
