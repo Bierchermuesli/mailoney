@@ -124,6 +124,27 @@ def test_json_format_session_ended_summary_flattened(capture_events):
     assert payload["last_response_code"] == 221
 
 
+def test_json_operational_formatter_renders_log_record():
+    """Operational records (mailoney.core etc.) get a uniform JSON shape."""
+    formatter = events.JsonOperationalFormatter()
+    record = logging.LogRecord(
+        name="mailoney.core",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg="Connection from %s:%d",
+        args=("1.2.3.4", 4444),
+        exc_info=None,
+    )
+    payload = json.loads(formatter.format(record))
+    assert payload == {
+        "event": "log",
+        "logger": "mailoney.core",
+        "level": "INFO",
+        "message": "Connection from 1.2.3.4:4444",
+    }
+
+
 def test_init_event_logging_is_idempotent():
     """Calling init repeatedly should not stack handlers."""
     events.init_event_logging(json_format=False)

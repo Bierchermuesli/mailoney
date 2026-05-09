@@ -1,15 +1,18 @@
 """
 Structured event logging for Mailoney.
 
-Emits one log record per honeypot event (session start/end, credential
-capture). Records flow through a dedicated `mailoney.events` logger so
-operators can route them independently of operational logs.
+Two flavours of records flow through this module:
 
-Output format is controlled by `init_event_logging(json_format=...)`:
-  - text (default): one-line `<event> k=v ...` summary; bulky nested
-    fields (commands list, captured credentials) are omitted to keep
-    the line readable.
-  - JSON Lines: one JSON object per event, including all fields.
+  * Honeypot **events** (session_started, credential_captured,
+    session_ended) emitted by the dedicated ``mailoney.events`` logger.
+    These carry an ``event_type`` and a structured ``event_data`` dict.
+  * **Operational** log records emitted by every other logger
+    (``mailoney.core``, ``mailoney.mail_storage``, ``mailoney.db``,
+    plus third-party libraries). These are plain ``logging.LogRecord``s.
+
+When ``MAILONEY_LOG_JSON=true``, both flavours are serialized as
+JSON Lines so the entire stdout stream parses with a single rule. When
+the flag is off, both render as human-readable text.
 
 Neither format includes an internal timestamp field. Log shippers
 (docker, journald, promtail, vector, vlogs ingest) attach their own
@@ -28,7 +31,7 @@ _logger = logging.getLogger(EVENT_LOGGER_NAME)
 
 
 class JsonEventFormatter(logging.Formatter):
-    """One JSON object per line, including all event fields."""
+    """JSON Lines formatter for honeypot events."""
 
     def format(self, record: logging.LogRecord) -> str:
         data: Dict[str, Any] = {
@@ -46,6 +49,26 @@ class JsonEventFormatter(logging.Formatter):
         else:
             data.update(event_data)
         return json.dumps(data, default=str)
+
+
+class JsonOperationalFormatter(logging.Formatter):
+    """JSON Lines formatter for non-event (operational) log records.
+
+    Wraps each ``logging.LogRecord`` from ``mailoney.core`` etc. in a
+    flat JSON object with a fixed shape so the whole stdout stream is
+    uniformly parseable when ``MAILONEY_LOG_JSON=true``.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps(
+            {
+                "event": "log",
+                "logger": record.name,
+                "level": record.levelname,
+                "message": record.getMessage(),
+            },
+            default=str,
+        )
 
 
 class TextEventFormatter(logging.Formatter):

@@ -448,7 +448,11 @@ def parse_args() -> argparse.Namespace:
         '--log-json',
         action='store_true',
         default=get_settings().log_json,
-        help='Emit honeypot events as JSON Lines instead of human-readable text.'
+        help=(
+            'Emit every log line — both honeypot events and operational '
+            'records — as JSON Lines on stdout. Default is human-readable '
+            'text for both.'
+        )
     )
 
     return parser.parse_args()
@@ -474,8 +478,10 @@ def run_server() -> None:
     # Parse command-line arguments
     args = parse_args()
     
-    # Configure logging
-    configure_logging(args.log_level)
+    # Configure logging. The same flag drives both the operational
+    # (root) logger and the events logger so the entire stdout stream
+    # is uniformly text or uniformly JSON.
+    configure_logging(args.log_level, json_format=args.log_json)
     events.init_event_logging(json_format=args.log_json)
 
     # Display banner
