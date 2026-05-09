@@ -6,6 +6,7 @@ import threading
 import logging
 import json
 import sys
+import time
 import uuid
 import argparse
 from time import strftime
@@ -119,6 +120,7 @@ class SMTPHoneypot:
         session_outcome = "ok"
         metrics.CONNECTIONS_TOTAL.inc()
         metrics.ACTIVE_SESSIONS.inc()
+        session_started = time.monotonic()
         events.session_started(
             session_uuid=session_uuid,
             src_ip=addr[0],
@@ -213,6 +215,9 @@ class SMTPHoneypot:
             session_outcome = "error"
         finally:
             metrics.SESSIONS_TOTAL.labels(result=session_outcome).inc()
+            metrics.SESSION_DURATION_SECONDS.observe(time.monotonic() - session_started)
+            if not any(entry.get("direction") == "in" for entry in session_log):
+                metrics.BANNER_ONLY_SESSIONS_TOTAL.inc()
             metrics.ACTIVE_SESSIONS.dec()
             client_socket.close()
             logger.info(f"Connection closed for {addr[0]}:{addr[1]} (dest: {self.bind_ip}:{self.bind_port})")
