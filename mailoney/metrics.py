@@ -7,9 +7,10 @@ served unless ``MAILONEY_METRICS_PORT`` is set (or ``--metrics-port``
 is passed).
 """
 import logging
+import time
 from typing import Optional
 
-from prometheus_client import Counter, Gauge, Info, start_http_server
+from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
 
 from . import __version__
 
@@ -45,6 +46,25 @@ ACTIVE_SESSIONS = Gauge(
     "mailoney_smtp_active_sessions",
     "SMTP sessions currently in flight.",
 )
+
+SESSION_DURATION_SECONDS = Histogram(
+    "mailoney_smtp_session_duration_seconds",
+    "Duration of SMTP sessions in seconds, from accept to close.",
+    buckets=(0.1, 0.5, 1, 2, 5, 10, 30, 60, 300, 600),
+)
+
+BANNER_ONLY_SESSIONS_TOTAL = Counter(
+    "mailoney_smtp_banner_only_sessions_total",
+    "Sessions where the client connected but never sent a command "
+    "(typical of port scanners).",
+)
+
+START_TIME_SECONDS = Gauge(
+    "mailoney_start_time_seconds",
+    "Unix timestamp at which the honeypot process started. "
+    "Compute uptime in PromQL with `time() - mailoney_start_time_seconds`.",
+)
+START_TIME_SECONDS.set(time.time())
 
 
 # Pre-warm known command labels so they appear in /metrics output even

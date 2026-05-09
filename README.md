@@ -175,6 +175,9 @@ Exposed metrics:
 | `mailoney_smtp_credentials_captured_total` | Counter | — | AUTH PLAIN credentials captured. |
 | `mailoney_smtp_commands_total` | Counter | `command` | SMTP commands by verb (`ehlo`, `helo`, `auth`, `mail`, `rcpt`, `data`, `quit`, `unknown`). |
 | `mailoney_smtp_active_sessions` | Gauge | — | Sessions currently in flight. |
+| `mailoney_smtp_session_duration_seconds` | Histogram | — | Time from accept to close, per session. |
+| `mailoney_smtp_banner_only_sessions_total` | Counter | — | Sessions where the client connected but never sent a command (port-scanner signal). |
+| `mailoney_start_time_seconds` | Gauge | — | Unix timestamp at process start. Compute uptime in PromQL with `time() - mailoney_start_time_seconds`. |
 | `mailoney_build_info` | Info | `version` | Mailoney build/version info. |
 
 The endpoint binds dual-stack (`::`) by default. Override with
