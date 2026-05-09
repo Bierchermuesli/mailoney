@@ -21,20 +21,53 @@ adds noise.
 
 Events always emit; the database is a separate, optional sink.
 """
+import contextlib
+import contextvars
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 
 EVENT_LOGGER_NAME = "mailoney.events"
+
+# Per-thread session correlation id. Set by ``session_context`` while a
+# connection is being handled; the operational JSON formatter copies it
+# onto every log record emitted from that context. Lets a single Loki /
+# vlogs query pull *all* lines (events + operational) for one session.
+_session_uuid_var: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "mailoney_session_uuid", default=None
+)
+
+
+@contextlib.contextmanager
+def session_context(session_uuid: str) -> Iterator[None]:
+    """Bind ``session_uuid`` to the current execution context.
+
+    All JSON log records emitted from within the ``with`` block — both
+    structured events and plain operational log lines — automatically
+    carry the ``session_uuid`` field, with no manual plumbing through
+    call chains. Reset cleanly on exit even if the body raises.
+    """
+    token = _session_uuid_var.set(session_uuid)
+    try:
+        yield
+    finally:
+        _session_uuid_var.reset(token)
+
 
 _logger = logging.getLogger(EVENT_LOGGER_NAME)
 
 
 class JsonEventFormatter(logging.Formatter):
-    """JSON Lines formatter for honeypot events."""
+    """JSON Lines formatter for honeypot events.
+
+    Every record carries a ``logger`` field (always ``mailoney.events``)
+    so log shippers can match all mailoney output — events and
+    operational alike — with a single ``logger =~ "^mailoney\\."`` rule.
+    """
 
     def format(self, record: logging.LogRecord) -> str:
         data: Dict[str, Any] = {
+            "logger": record.name,
             "event": getattr(record, "event_type", record.getMessage()),
         }
         event_data = getattr(record, "event_data", {}) or {}
@@ -57,18 +90,23 @@ class JsonOperationalFormatter(logging.Formatter):
     Wraps each ``logging.LogRecord`` from ``mailoney.core`` etc. in a
     flat JSON object with a fixed shape so the whole stdout stream is
     uniformly parseable when ``MAILONEY_LOG_JSON=true``.
+
+    Picks up the active ``session_uuid`` (when one is bound via
+    ``session_context``) so operational lines can be correlated with
+    structured events.
     """
 
     def format(self, record: logging.LogRecord) -> str:
-        return json.dumps(
-            {
-                "event": "log",
-                "logger": record.name,
-                "level": record.levelname,
-                "message": record.getMessage(),
-            },
-            default=str,
-        )
+        data: Dict[str, Any] = {
+            "logger": record.name,
+            "event": "log",
+            "level": record.levelname,
+            "message": record.getMessage(),
+        }
+        session_uuid = _session_uuid_var.get()
+        if session_uuid is not None:
+            data["session_uuid"] = session_uuid
+        return json.dumps(data, default=str)
 
 
 class TextEventFormatter(logging.Formatter):

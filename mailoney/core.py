@@ -97,108 +97,111 @@ class SMTPHoneypot:
             addr: Client address tuple (ip, port)
         """
         session_uuid = str(uuid.uuid4())
-        events.session_started(
-            session_uuid=session_uuid,
-            src_ip=addr[0],
-            src_port=addr[1],
-            server_name=self.server_name,
-            dest_ip=self.bind_ip,
-            dest_port=self.bind_port,
-        )
-        session_record = create_session(
-            addr[0], addr[1], self.server_name,
-            dest_ip=self.bind_ip,
-            dest_port=self.bind_port
-        )
+        # Bind the session UUID to the current execution context so every
+        # operational log record emitted from this thread is auto-tagged.
+        with events.session_context(session_uuid):
+            events.session_started(
+                session_uuid=session_uuid,
+                src_ip=addr[0],
+                src_port=addr[1],
+                server_name=self.server_name,
+                dest_ip=self.bind_ip,
+                dest_port=self.bind_port,
+            )
+            session_record = create_session(
+                addr[0], addr[1], self.server_name,
+                dest_ip=self.bind_ip,
+                dest_port=self.bind_port
+            )
 
-        # Per-session summary state. We emit a single end-of-session record
-        # rather than a timestamped per-command transcript: the latter scales
-        # linearly with attacker chattiness and buries the actionable signal
-        # under noise.
-        commands: List[str] = []
-        credentials: List[str] = []
-        last_response_code: Optional[int] = None
-        session_started_at = time.monotonic()
+            # Per-session summary state. We emit a single end-of-session
+            # record rather than a timestamped per-command transcript:
+            # the latter scales linearly with attacker chattiness and
+            # buries the actionable signal under noise.
+            commands: List[str] = []
+            credentials: List[str] = []
+            last_response_code: Optional[int] = None
+            session_started_at = time.monotonic()
 
-        def send(response: str) -> None:
-            nonlocal last_response_code
-            client_socket.send(response.encode())
-            try:
-                last_response_code = int(response[:3])
-            except ValueError:
-                pass
-
-        try:
-            send(f"220 {self.server_name} ESMTP Service Ready\n")
-
-            # Handle client commands
-            error_count = 0
-            while error_count < 10:
+            def send(response: str) -> None:
+                nonlocal last_response_code
+                client_socket.send(response.encode())
                 try:
-                    request = client_socket.recv(4096).decode().strip().lower()
-                    if not request:
-                        break
+                    last_response_code = int(response[:3])
+                except ValueError:
+                    pass
 
-                    commands.append(request)
-                    logger.debug(f"Client: {request}")
+            try:
+                send(f"220 {self.server_name} ESMTP Service Ready\n")
 
-                    # EHLO / HELO
-                    if request.startswith('ehlo') or request.startswith('helo'):
-                        send(self.ehlo_response)
-                        error_count = 0
+                # Handle client commands
+                error_count = 0
+                while error_count < 10:
+                    try:
+                        request = client_socket.recv(4096).decode().strip().lower()
+                        if not request:
+                            break
 
-                    # AUTH PLAIN
-                    elif request.startswith('auth plain'):
-                        parts = request.split()
-                        if len(parts) >= 3:
-                            auth_string = parts[2]
-                            credentials.append(auth_string)
-                            events.credential_captured(session_uuid, auth_string)
-                            log_credential(session_record.id, auth_string)
-                            logger.info(f"Captured credential: {auth_string}")
-                        send("235 2.7.0 Authentication failed\n")
+                        commands.append(request)
+                        logger.debug(f"Client: {request}")
 
-                    # QUIT
-                    elif request.startswith('quit'):
-                        send("221 2.0.0 Goodbye\n")
-                        break
+                        # EHLO / HELO
+                        if request.startswith('ehlo') or request.startswith('helo'):
+                            send(self.ehlo_response)
+                            error_count = 0
 
-                    # MAIL FROM: / RCPT TO: / DATA — accepted but no body handling
-                    elif request.startswith(('mail from:', 'rcpt to:', 'data')):
-                        send("250 2.1.0 OK\n")
-                        error_count = 0
+                        # AUTH PLAIN
+                        elif request.startswith('auth plain'):
+                            parts = request.split()
+                            if len(parts) >= 3:
+                                auth_string = parts[2]
+                                credentials.append(auth_string)
+                                events.credential_captured(session_uuid, auth_string)
+                                log_credential(session_record.id, auth_string)
+                                logger.info(f"Captured credential: {auth_string}")
+                            send("235 2.7.0 Authentication failed\n")
 
-                    # Unknown command
-                    else:
-                        send("502 5.5.2 Error: command not recognized\n")
+                        # QUIT
+                        elif request.startswith('quit'):
+                            send("221 2.0.0 Goodbye\n")
+                            break
+
+                        # MAIL FROM: / RCPT TO: / DATA — accepted, no body handling
+                        elif request.startswith(('mail from:', 'rcpt to:', 'data')):
+                            send("250 2.1.0 OK\n")
+                            error_count = 0
+
+                        # Unknown command
+                        else:
+                            send("502 5.5.2 Error: command not recognized\n")
+                            error_count += 1
+
+                    except Exception as e:
+                        logger.error(f"Error handling client request: {e}")
                         error_count += 1
 
-                except Exception as e:
-                    logger.error(f"Error handling client request: {e}")
-                    error_count += 1
+            except Exception as e:
+                logger.error(f"Error in client handler: {e}")
+            finally:
+                duration = time.monotonic() - session_started_at
+                summary: Dict[str, Any] = {
+                    "src_ip": addr[0],
+                    "src_port": addr[1],
+                    "dest_ip": self.bind_ip,
+                    "dest_port": self.bind_port,
+                    "duration_seconds": round(duration, 3),
+                    "command_count": len(commands),
+                    "commands": commands,
+                    "last_response_code": last_response_code,
+                }
+                if credentials:
+                    summary["credentials"] = credentials
 
-        except Exception as e:
-            logger.error(f"Error in client handler: {e}")
-        finally:
-            duration = time.monotonic() - session_started_at
-            summary: Dict[str, Any] = {
-                "src_ip": addr[0],
-                "src_port": addr[1],
-                "dest_ip": self.bind_ip,
-                "dest_port": self.bind_port,
-                "duration_seconds": round(duration, 3),
-                "command_count": len(commands),
-                "commands": commands,
-                "last_response_code": last_response_code,
-            }
-            if credentials:
-                summary["credentials"] = credentials
+                events.session_ended(session_uuid=session_uuid, summary=summary)
+                update_session_data(session_record.id, json.dumps(summary))
 
-            events.session_ended(session_uuid=session_uuid, summary=summary)
-            update_session_data(session_record.id, json.dumps(summary))
-
-            client_socket.close()
-            logger.info(f"Connection closed for {addr[0]}:{addr[1]} (dest: {self.bind_ip}:{self.bind_port})")
+                client_socket.close()
+                logger.info(f"Connection closed for {addr[0]}:{addr[1]} (dest: {self.bind_ip}:{self.bind_port})")
             
     def stop(self) -> None:
         """
