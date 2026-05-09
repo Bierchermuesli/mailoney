@@ -96,6 +96,9 @@ def test_json_format_includes_all_fields(capture_events):
     # Log shipper / docker / journald supplies the ingestion timestamp;
     # we don't include a duplicate ``ts`` field in the message body.
     assert "ts" not in payload
+    # Every JSON record carries ``logger`` so a single ``logger ~= mailoney.*``
+    # rule matches both event and operational lines.
+    assert payload["logger"] == events.EVENT_LOGGER_NAME
 
 
 def test_json_format_session_ended_summary_flattened(capture_events):
@@ -127,25 +130,46 @@ def test_json_format_session_ended_summary_flattened(capture_events):
     assert payload["mail"] == summary["mail"]
 
 
-def test_json_operational_formatter_renders_log_record():
-    """Operational records (mailoney.core etc.) get a uniform JSON shape."""
-    formatter = events.JsonOperationalFormatter()
-    record = logging.LogRecord(
-        name="mailoney.core",
+def _make_log_record(name="mailoney.core", msg="Connection from %s:%d", args=("1.2.3.4", 4444)):
+    return logging.LogRecord(
+        name=name,
         level=logging.INFO,
         pathname="",
         lineno=0,
-        msg="Connection from %s:%d",
-        args=("1.2.3.4", 4444),
+        msg=msg,
+        args=args,
         exc_info=None,
     )
-    payload = json.loads(formatter.format(record))
+
+
+def test_json_operational_formatter_renders_log_record():
+    """Operational records (mailoney.core etc.) get a uniform JSON shape."""
+    formatter = events.JsonOperationalFormatter()
+    payload = json.loads(formatter.format(_make_log_record()))
     assert payload == {
-        "event": "log",
         "logger": "mailoney.core",
+        "event": "log",
         "level": "INFO",
         "message": "Connection from 1.2.3.4:4444",
     }
+
+
+def test_json_operational_formatter_picks_up_session_context():
+    """Inside ``session_context``, operational records carry session_uuid."""
+    formatter = events.JsonOperationalFormatter()
+    record = _make_log_record(name="mailoney.mail_storage", msg="stored", args=())
+
+    # Outside the context: no session_uuid field.
+    payload = json.loads(formatter.format(record))
+    assert "session_uuid" not in payload
+
+    with events.session_context("abc-123"):
+        payload = json.loads(formatter.format(record))
+    assert payload["session_uuid"] == "abc-123"
+
+    # Cleanly removed after the with block.
+    payload = json.loads(formatter.format(record))
+    assert "session_uuid" not in payload
 
 
 def test_init_event_logging_is_idempotent():

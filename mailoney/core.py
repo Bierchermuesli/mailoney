@@ -214,193 +214,196 @@ class SMTPHoneypot:
             addr: Client address tuple (ip, port)
         """
         session_uuid = str(uuid.uuid4())
-        session_outcome = "ok"
-        metrics.CONNECTIONS_TOTAL.inc()
-        metrics.ACTIVE_SESSIONS.inc()
-        session_started = time.monotonic()
-        events.session_started(
-            session_uuid=session_uuid,
-            src_ip=addr[0],
-            src_port=addr[1],
-            server_name=self.server_name,
-            dest_ip=self.bind_ip,
-            dest_port=self.bind_port,
-        )
-        session_record = create_session(
-            addr[0], addr[1], self.server_name,
-            dest_ip=self.bind_ip,
-            dest_port=self.bind_port
-        )
+        # Bind the session UUID to the current execution context so every
+        # operational log record emitted from this thread is auto-tagged.
+        with events.session_context(session_uuid):
+            session_outcome = "ok"
+            metrics.CONNECTIONS_TOTAL.inc()
+            metrics.ACTIVE_SESSIONS.inc()
+            session_started = time.monotonic()
+            events.session_started(
+                session_uuid=session_uuid,
+                src_ip=addr[0],
+                src_port=addr[1],
+                server_name=self.server_name,
+                dest_ip=self.bind_ip,
+                dest_port=self.bind_port,
+            )
+            session_record = create_session(
+                addr[0], addr[1], self.server_name,
+                dest_ip=self.bind_ip,
+                dest_port=self.bind_port
+            )
 
-        # Per-session summary state. We emit a single end-of-session record
-        # rather than a timestamped per-command transcript: the latter scales
-        # linearly with attacker chattiness and buries the actionable signal
-        # under noise.
-        commands: List[str] = []
-        credentials: List[str] = []
-        mail_info: Optional[Dict[str, Any]] = None
-        tls_info: Optional[Dict[str, Any]] = None
-        last_response_code: Optional[int] = None
-        tls_active = False
+            # Per-session summary state. We emit a single end-of-session
+            # record rather than a timestamped per-command transcript:
+            # the latter scales linearly with attacker chattiness and
+            # buries the actionable signal under noise.
+            commands: List[str] = []
+            credentials: List[str] = []
+            mail_info: Optional[Dict[str, Any]] = None
+            tls_info: Optional[Dict[str, Any]] = None
+            last_response_code: Optional[int] = None
+            tls_active = False
 
-        def send(response: str) -> None:
-            nonlocal last_response_code
-            client_socket.send(response.encode())
-            try:
-                last_response_code = int(response[:3])
-            except ValueError:
-                pass
-
-        try:
-            send(f"220 {self.server_name} ESMTP Service Ready\n")
-
-            # Handle client commands
-            error_count = 0
-            while error_count < 10:
+            def send(response: str) -> None:
+                nonlocal last_response_code
+                client_socket.send(response.encode())
                 try:
-                    request = client_socket.recv(4096).decode().strip().lower()
-                    if not request:
-                        break
+                    last_response_code = int(response[:3])
+                except ValueError:
+                    pass
 
-                    commands.append(request)
-                    logger.debug(f"Client: {request}")
-                    metrics.COMMANDS_TOTAL.labels(
-                        command=metrics.classify_command(request)
-                    ).inc()
+            try:
+                send(f"220 {self.server_name} ESMTP Service Ready\n")
 
-                    # EHLO/HELO. Post-TLS variant drops STARTTLS per RFC 3207 §4.2.
-                    if request.startswith('ehlo') or request.startswith('helo'):
-                        send(self.ehlo_response_post_tls if tls_active else self.ehlo_response)
-                        error_count = 0
-
-                    # STARTTLS — upgrade the connection in place.
-                    elif request.startswith('starttls'):
-                        if self.tls_context is None:
-                            send("454 4.7.0 TLS not available\n")
-                            error_count += 1
-                        elif tls_active:
-                            send("503 5.5.1 STARTTLS already active\n")
-                            error_count += 1
-                        else:
-                            send("220 2.0.0 Ready to start TLS\n")
-                            try:
-                                client_socket.settimeout(TLS_HANDSHAKE_TIMEOUT_SECONDS)
-                                client_socket = self.tls_context.wrap_socket(
-                                    client_socket,
-                                    server_side=True,
-                                )
-                                client_socket.settimeout(None)
-                                tls_active = True
-                                tls_info = {
-                                    "active": True,
-                                    "version": client_socket.version(),
-                                    "cipher": client_socket.cipher()[0] if client_socket.cipher() else None,
-                                }
-                                error_count = 0
-                            except (ssl.SSLError, OSError, socket.timeout) as e:
-                                logger.warning(f"TLS handshake failed for {addr[0]}:{addr[1]}: {e}")
-                                tls_info = {"active": False, "error": str(e)}
-                                break
-
-                    # AUTH PLAIN
-                    elif request.startswith('auth plain'):
-                        parts = request.split()
-                        if len(parts) >= 3:
-                            auth_string = parts[2]
-                            credentials.append(auth_string)
-                            metrics.CREDENTIALS_CAPTURED_TOTAL.inc()
-                            events.credential_captured(session_uuid, auth_string)
-                            log_credential(session_record.id, auth_string)
-                            logger.info(f"Captured credential: {auth_string}")
-                        send("235 2.7.0 Authentication failed\n")
-
-                    # QUIT
-                    elif request.startswith('quit'):
-                        send("221 2.0.0 Goodbye\n")
-                        break
-
-                    # MAIL FROM: / RCPT TO: — accept envelope, no body involved.
-                    elif request.startswith(('mail from:', 'rcpt to:')):
-                        send("250 2.1.0 OK\n")
-                        error_count = 0
-
-                    # DATA — enter body-receive mode, read until terminator
-                    # or size cap, then return to command mode.
-                    elif request.startswith('data'):
-                        send("354 End data with <CR><LF>.<CR><LF>\n")
-                        body, terminator_found = self._receive_mail_body(client_socket.recv)
-
-                        mail_info = {
-                            "size": len(body),
-                            "truncated": not terminator_found,
-                        }
-                        if self.mail_dir:
-                            try:
-                                mail_info["body_path"] = store_mail_body(
-                                    self.mail_dir, addr[0], session_uuid, body,
-                                )
-                            except OSError as e:
-                                logger.error(f"Failed to write mail body: {e}")
-                                # Fall back to inline so we don't lose the data.
-                                mail_info["data"] = body.decode("utf-8", errors="replace")
-                                mail_info["body_path_error"] = str(e)
-                        else:
-                            mail_info["data"] = body.decode("utf-8", errors="replace")
-
-                        if terminator_found:
-                            send("250 2.0.0 Ok\n")
-                        elif len(body) >= MAX_MAIL_BODY_BYTES:
-                            send("552 5.3.4 Message size limit exceeded\n")
-                        else:
-                            send("421 4.4.2 Connection closed\n")
+                # Handle client commands
+                error_count = 0
+                while error_count < 10:
+                    try:
+                        request = client_socket.recv(4096).decode().strip().lower()
+                        if not request:
                             break
-                        error_count = 0
 
-                    # Unknown command
-                    else:
-                        send("502 5.5.2 Error: command not recognized\n")
+                        commands.append(request)
+                        logger.debug(f"Client: {request}")
+                        metrics.COMMANDS_TOTAL.labels(
+                            command=metrics.classify_command(request)
+                        ).inc()
+
+                        # EHLO/HELO. Post-TLS variant drops STARTTLS per RFC 3207 §4.2.
+                        if request.startswith('ehlo') or request.startswith('helo'):
+                            send(self.ehlo_response_post_tls if tls_active else self.ehlo_response)
+                            error_count = 0
+
+                        # STARTTLS — upgrade the connection in place.
+                        elif request.startswith('starttls'):
+                            if self.tls_context is None:
+                                send("454 4.7.0 TLS not available\n")
+                                error_count += 1
+                            elif tls_active:
+                                send("503 5.5.1 STARTTLS already active\n")
+                                error_count += 1
+                            else:
+                                send("220 2.0.0 Ready to start TLS\n")
+                                try:
+                                    client_socket.settimeout(TLS_HANDSHAKE_TIMEOUT_SECONDS)
+                                    client_socket = self.tls_context.wrap_socket(
+                                        client_socket,
+                                        server_side=True,
+                                    )
+                                    client_socket.settimeout(None)
+                                    tls_active = True
+                                    tls_info = {
+                                        "active": True,
+                                        "version": client_socket.version(),
+                                        "cipher": client_socket.cipher()[0] if client_socket.cipher() else None,
+                                    }
+                                    error_count = 0
+                                except (ssl.SSLError, OSError, socket.timeout) as e:
+                                    logger.warning(f"TLS handshake failed for {addr[0]}:{addr[1]}: {e}")
+                                    tls_info = {"active": False, "error": str(e)}
+                                    break
+
+                        # AUTH PLAIN
+                        elif request.startswith('auth plain'):
+                            parts = request.split()
+                            if len(parts) >= 3:
+                                auth_string = parts[2]
+                                credentials.append(auth_string)
+                                metrics.CREDENTIALS_CAPTURED_TOTAL.inc()
+                                events.credential_captured(session_uuid, auth_string)
+                                log_credential(session_record.id, auth_string)
+                                logger.info(f"Captured credential: {auth_string}")
+                            send("235 2.7.0 Authentication failed\n")
+
+                        # QUIT
+                        elif request.startswith('quit'):
+                            send("221 2.0.0 Goodbye\n")
+                            break
+
+                        # MAIL FROM: / RCPT TO: — accept envelope, no body involved.
+                        elif request.startswith(('mail from:', 'rcpt to:')):
+                            send("250 2.1.0 OK\n")
+                            error_count = 0
+
+                        # DATA — enter body-receive mode, read until terminator
+                        # or size cap, then return to command mode.
+                        elif request.startswith('data'):
+                            send("354 End data with <CR><LF>.<CR><LF>\n")
+                            body, terminator_found = self._receive_mail_body(client_socket.recv)
+
+                            mail_info = {
+                                "size": len(body),
+                                "truncated": not terminator_found,
+                            }
+                            if self.mail_dir:
+                                try:
+                                    mail_info["body_path"] = store_mail_body(
+                                        self.mail_dir, addr[0], session_uuid, body,
+                                    )
+                                except OSError as e:
+                                    logger.error(f"Failed to write mail body: {e}")
+                                    # Fall back to inline so we don't lose the data.
+                                    mail_info["data"] = body.decode("utf-8", errors="replace")
+                                    mail_info["body_path_error"] = str(e)
+                            else:
+                                mail_info["data"] = body.decode("utf-8", errors="replace")
+
+                            if terminator_found:
+                                send("250 2.0.0 Ok\n")
+                            elif len(body) >= MAX_MAIL_BODY_BYTES:
+                                send("552 5.3.4 Message size limit exceeded\n")
+                            else:
+                                send("421 4.4.2 Connection closed\n")
+                                break
+                            error_count = 0
+
+                        # Unknown command
+                        else:
+                            send("502 5.5.2 Error: command not recognized\n")
+                            error_count += 1
+
+                    except Exception as e:
+                        logger.error(f"Error handling client request: {e}")
                         error_count += 1
 
-                except Exception as e:
-                    logger.error(f"Error handling client request: {e}")
-                    error_count += 1
+            except Exception as e:
+                logger.error(f"Error in client handler: {e}")
+                session_outcome = "error"
+            finally:
+                duration = time.monotonic() - session_started
+                summary: Dict[str, Any] = {
+                    "src_ip": addr[0],
+                    "src_port": addr[1],
+                    "dest_ip": self.bind_ip,
+                    "dest_port": self.bind_port,
+                    "duration_seconds": round(duration, 3),
+                    "command_count": len(commands),
+                    "commands": commands,
+                    "last_response_code": last_response_code,
+                    "outcome": session_outcome,
+                }
+                if credentials:
+                    summary["credentials"] = credentials
+                if mail_info is not None:
+                    summary["mail"] = mail_info
+                if tls_info is not None:
+                    summary["tls"] = tls_info
 
-        except Exception as e:
-            logger.error(f"Error in client handler: {e}")
-            session_outcome = "error"
-        finally:
-            duration = time.monotonic() - session_started
-            summary: Dict[str, Any] = {
-                "src_ip": addr[0],
-                "src_port": addr[1],
-                "dest_ip": self.bind_ip,
-                "dest_port": self.bind_port,
-                "duration_seconds": round(duration, 3),
-                "command_count": len(commands),
-                "commands": commands,
-                "last_response_code": last_response_code,
-                "outcome": session_outcome,
-            }
-            if credentials:
-                summary["credentials"] = credentials
-            if mail_info is not None:
-                summary["mail"] = mail_info
-            if tls_info is not None:
-                summary["tls"] = tls_info
+                events.session_ended(session_uuid=session_uuid, summary=summary)
+                update_session_data(session_record.id, json.dumps(summary))
 
-            events.session_ended(session_uuid=session_uuid, summary=summary)
-            update_session_data(session_record.id, json.dumps(summary))
-
-            metrics.SESSIONS_TOTAL.labels(result=session_outcome).inc()
-            metrics.SESSION_DURATION_SECONDS.observe(duration)
-            if not commands:
-                metrics.BANNER_ONLY_SESSIONS_TOTAL.inc()
-            metrics.ACTIVE_SESSIONS.dec()
-            try:
-                client_socket.close()
-            except OSError:
-                pass
-            logger.info(f"Connection closed for {addr[0]}:{addr[1]} (dest: {self.bind_ip}:{self.bind_port})")
+                metrics.SESSIONS_TOTAL.labels(result=session_outcome).inc()
+                metrics.SESSION_DURATION_SECONDS.observe(duration)
+                if not commands:
+                    metrics.BANNER_ONLY_SESSIONS_TOTAL.inc()
+                metrics.ACTIVE_SESSIONS.dec()
+                try:
+                    client_socket.close()
+                except OSError:
+                    pass
+                logger.info(f"Connection closed for {addr[0]}:{addr[1]} (dest: {self.bind_ip}:{self.bind_port})")
             
     def stop(self) -> None:
         """
