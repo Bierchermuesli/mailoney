@@ -114,9 +114,31 @@ python main.py
 | `MAILONEY_BIND_PORT` | Port to listen on | 25 |
 | `MAILONEY_SERVER_NAME` | SMTP server name | mail.example.com |
 | `MAILONEY_CONN_TIMEOUT` | Per-connection inactivity timeout (seconds). A client that sends nothing for this long is dropped, so slow-loris connections cannot pin handler threads. `0` disables it. | 30 |
-| `MAILONEY_DB_URL` | Database connection URL | sqlite:///mailoney.db |
+| `MAILONEY_DB_URL` | Database connection URL. Set to an empty string (`MAILONEY_DB_URL=`) to disable the database and run in event-logging-only mode. | sqlite:///mailoney.db |
 | `MAILONEY_MAIL_DIR` | When set, captured SMTP message bodies are written under this directory as `<YYYY-MM-DD>/<src-ip>/<session>.eml` and the session log records the relative path. Unset = bodies are discarded after their metadata (size, truncated flag) is recorded. Operators opt *in* to body retention. | (unset) |
 | `MAILONEY_LOG_LEVEL` | Logging level | INFO |
+| `MAILONEY_LOG_JSON` | When `true`, emit honeypot events (session start/end, captured credentials) as JSON Lines on the `mailoney.events` logger. Default emits human-readable text. | false |
+
+### Running without a database
+
+Mailoney can run as a pure event emitter — useful when you ship logs to a
+SIEM, ELK stack, Loki, etc. and don't want to operate a SQL database just
+for honeypot capture.
+
+```bash
+# DB-less mode, JSON log output suitable for log shippers
+docker run -p 25:25 \
+  -e MAILONEY_DB_URL= \
+  -e MAILONEY_LOG_JSON=true \
+  ghcr.io/phin3has/mailoney:latest
+```
+
+When the database is disabled:
+- No tables are created, no migrations are run, no DB driver is required at
+  runtime.
+- Per-session events (`session_started`, `credential_captured`,
+  `session_ended`) are emitted to the `mailoney.events` logger.
+- In JSON mode, `session_ended` events include the full SMTP transcript.
 
 ### Command-line Arguments
 
@@ -131,9 +153,10 @@ Available arguments:
 - `-p`, `--port`: Port to listen on
 - `-s`, `--server-name`: Server name to display in SMTP responses
 - `--conn-timeout`: Per-connection inactivity timeout in seconds (0 disables it)
-- `-d`, `--db-url`: Database URL
+- `-d`, `--db-url`: Database URL. Pass an empty string to disable the database.
 - `--mail-dir`: Directory under which captured message bodies are written
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+- `--log-json`: Emit honeypot events as JSON Lines instead of human-readable text.
 
 ### Captured mail bodies
 

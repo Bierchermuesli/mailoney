@@ -15,6 +15,7 @@ from typing import Optional, Tuple, Dict, Any, List
 from .db import create_session, update_session_data, log_credential, init_db
 from .config import get_settings, configure_logging
 from .mail_storage import store_mail_body
+from . import events
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,14 @@ class SMTPHoneypot:
             addr: Client address tuple (ip, port)
         """
         session_uuid = str(uuid.uuid4())
+        events.session_started(
+            session_uuid=session_uuid,
+            src_ip=addr[0],
+            src_port=addr[1],
+            server_name=self.server_name,
+            dest_ip=self.bind_ip,
+            dest_port=self.bind_port,
+        )
         session_record = create_session(
             addr[0], addr[1], self.server_name,
             dest_ip=self.bind_ip,
@@ -232,6 +241,7 @@ class SMTPHoneypot:
                         parts = request.split()
                         if len(parts) >= 3:
                             auth_string = parts[2]
+                            events.credential_captured(session_uuid, auth_string)
                             log_credential(session_record.id, auth_string)
                             logger.info(f"Captured credential: {auth_string}")
                             
@@ -330,7 +340,12 @@ class SMTPHoneypot:
                     logger.error(f"Error handling client request: {e}")
                     error_count += 1
             
-            # Store the session log
+            # Emit session-end event (always) and persist transcript (DB only).
+            events.session_ended(
+                session_uuid=session_uuid,
+                command_count=len(session_log),
+                transcript=session_log,
+            )
             update_session_data(session_record.id, json.dumps(session_log))
             
         except Exception as e:
@@ -379,7 +394,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '-d', '--db-url',
         default=get_settings().db_url,
-        help='Database URL (default: sqlite:///mailoney.db)'
+        help=(
+            'Database URL (default: sqlite:///mailoney.db). '
+            'Pass an empty string to disable the database and run in '
+            'event-logging-only mode.'
+        )
     )
 
     parser.add_argument(
@@ -410,6 +429,13 @@ def parse_args() -> argparse.Namespace:
         help='Log level'
     )
 
+    parser.add_argument(
+        '--log-json',
+        action='store_true',
+        default=get_settings().log_json,
+        help='Emit honeypot events as JSON Lines instead of human-readable text.'
+    )
+
     return parser.parse_args()
 
 
@@ -435,12 +461,16 @@ def run_server() -> None:
     
     # Configure logging
     configure_logging(args.log_level)
-    
+    events.init_event_logging(json_format=args.log_json)
+
     # Display banner
     display_banner()
-    
-    # Initialize database
-    logger.info(f"Initializing database with URL: {args.db_url}")
+
+    # Initialize database (empty URL disables it; events still flow to logs).
+    if args.db_url == "":
+        logger.info("Database disabled; running in event-logging-only mode")
+    else:
+        logger.info(f"Initializing database with URL: {args.db_url}")
     init_db(args.db_url)
     
     # Create and start server

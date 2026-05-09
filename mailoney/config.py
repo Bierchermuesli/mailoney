@@ -26,7 +26,9 @@ class Settings(BaseSettings):
     # 0 or negative disables the timeout (not recommended).
     conn_timeout: int = Field(default=30)
 
-    # Database settings
+    # Database settings.
+    # An explicitly empty value (MAILONEY_DB_URL=) disables the DB and runs
+    # in event-logging-only mode.
     db_url: str = Field(default="sqlite:///mailoney.db")
 
     # Filesystem storage for captured mail bodies. Unset = bodies stay
@@ -37,6 +39,7 @@ class Settings(BaseSettings):
 
     # Logging settings
     log_level: str = Field(default="INFO")
+    log_json: bool = Field(default=False)
     
     # Configure the settings to use the MAILONEY_ prefix for environment variables
     model_config = SettingsConfigDict(
