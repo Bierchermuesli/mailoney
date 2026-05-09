@@ -92,7 +92,9 @@ def test_json_format_includes_all_fields(capture_events):
     assert payload["event"] == "credential_captured"
     assert payload["session_uuid"] == "abc-123"
     assert payload["auth_string"] == "dGVzdDp0ZXN0"
-    assert "ts" in payload
+    # Log shipper / docker / journald supplies the ingestion timestamp;
+    # we don't include a duplicate ``ts`` field in the message body.
+    assert "ts" not in payload
 
 
 def test_json_format_session_ended_summary_flattened(capture_events):
