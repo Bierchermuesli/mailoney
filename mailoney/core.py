@@ -60,8 +60,10 @@ class SMTPHoneypot:
             bind_port: Port to listen on
             server_name: Server name to display in SMTP responses
             mail_dir: When set, captured message bodies are written to disk
-                under this directory; the session log records the relative
-                path. When None, bodies stay inline in the session log.
+                under this directory and the session log records the
+                relative path. When None, bodies are discarded after
+                metadata (size, truncated flag) is recorded — operators
+                opt *in* to body retention rather than out of it.
             tls_cert: Path to PEM cert/chain. Both ``tls_cert`` and
                 ``tls_key`` must be provided to enable STARTTLS.
             tls_key: Path to PEM private key.
@@ -343,12 +345,19 @@ class SMTPHoneypot:
                                         self.mail_dir, addr[0], session_uuid, body,
                                     )
                                 except OSError as e:
+                                    # Body storage was requested but failed.
+                                    # Log the underlying error and surface it
+                                    # on the record; do NOT inline the body
+                                    # bytes — if the operator set MAIL_DIR
+                                    # they explicitly chose not to keep
+                                    # bodies in the log/DB stream, and an
+                                    # error path should not silently
+                                    # override that.
                                     logger.error(f"Failed to write mail body: {e}")
-                                    # Fall back to inline so we don't lose the data.
-                                    mail_info["data"] = body.decode("utf-8", errors="replace")
                                     mail_info["body_path_error"] = str(e)
-                            else:
-                                mail_info["data"] = body.decode("utf-8", errors="replace")
+                            # If self.mail_dir is unset, only metadata
+                            # (size, truncated) is retained. Operators opt
+                            # in to body retention by setting MAIL_DIR.
 
                             if terminator_found:
                                 send("250 2.0.0 Ok\n")

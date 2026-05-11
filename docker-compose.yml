@@ -10,6 +10,13 @@ services:
       - MAILONEY_SERVER_NAME=mail.example.com
       - MAILONEY_LOG_LEVEL=INFO
       - MAILONEY_DB_URL=postgresql://postgres:postgres@db:5432/mailoney
+      # Uncomment together with the volume mount below to retain
+      # captured SMTP message bodies on disk as .eml files. Without
+      # MAILONEY_MAIL_DIR set, bodies are discarded after their
+      # size/truncated metadata is recorded.
+      # - MAILONEY_MAIL_DIR=/var/lib/mailoney/mail
+    # volumes:
+    #   - ./mail-capture:/var/lib/mailoney/mail
     depends_on:
       - db
     
