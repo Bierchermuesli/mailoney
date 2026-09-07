@@ -89,7 +89,7 @@ def configure_logging(
     # Replace any existing StreamHandler (e.g. installed by basicConfig)
     # so a second call swaps the formatter instead of stacking handlers.
     for handler in list(root.handlers):
-        if isinstance(handler, logging.StreamHandler):
+        if type(handler) is logging.StreamHandler:
             root.removeHandler(handler)
 
     handler = logging.StreamHandler()
