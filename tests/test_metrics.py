@@ -29,6 +29,7 @@ from mailoney.metrics import (
         ("ehlo localhost", "ehlo"),
         ("HELO mx", "helo"),  # classify_command receives lowercased input
         ("auth plain dGVzdA==", "auth"),
+        ("starttls", "starttls"),
         ("mail from:<a@b>", "mail"),
         ("rcpt to:<c@d>", "rcpt"),
         ("data", "data"),
@@ -134,7 +135,7 @@ def test_metric_names_appear_in_exposition():
 def test_known_command_labels_are_prewarmed():
     """Pre-warmed labels appear in exposition even at zero count."""
     output = generate_latest().decode()
-    for verb in ("ehlo", "helo", "auth", "mail", "rcpt", "data", "quit", "unknown"):
+    for verb in ("ehlo", "helo", "auth", "starttls", "mail", "rcpt", "data", "quit", "unknown"):
         assert f'command="{verb}"' in output
 
 

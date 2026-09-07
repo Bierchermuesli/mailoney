@@ -38,7 +38,7 @@ CREDENTIALS_CAPTURED_TOTAL = Counter(
 COMMANDS_TOTAL = Counter(
     "mailoney_smtp_commands_total",
     "SMTP commands received from clients, partitioned by command verb.",
-    ["command"],  # ehlo | helo | auth | mail | rcpt | data | quit | unknown
+    ["command"],  # ehlo | helo | auth | starttls | mail | rcpt | data | quit | unknown
 )
 
 ACTIVE_SESSIONS = Gauge(
@@ -68,7 +68,7 @@ START_TIME_SECONDS.set(time.time())
 
 # Pre-warm known command labels so they appear in /metrics output even
 # when count is zero — makes Prometheus rules and dashboards saner.
-for _verb in ("ehlo", "helo", "auth", "mail", "rcpt", "data", "quit", "unknown"):
+for _verb in ("ehlo", "helo", "auth", "starttls", "mail", "rcpt", "data", "quit", "unknown"):
     COMMANDS_TOTAL.labels(command=_verb)
 for _result in ("ok", "error", "timeout"):
     SESSIONS_TOTAL.labels(result=_result)
@@ -83,6 +83,8 @@ def classify_command(request: str) -> str:
         return "helo"
     if request.startswith("auth"):
         return "auth"
+    if request.startswith("starttls"):
+        return "starttls"
     if request.startswith("mail from:"):
         return "mail"
     if request.startswith("rcpt to:"):
