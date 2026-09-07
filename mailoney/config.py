@@ -3,6 +3,7 @@ Configuration handling for Mailoney
 """
 import os
 import logging
+import sys
 from typing import Dict, Any, Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -36,10 +37,22 @@ class Settings(BaseSettings):
     # are written under <mail_dir>/<YYYY-MM-DD>/<src-ip>/<session>.eml
     # and the session log carries only the relative path.
     mail_dir: Optional[str] = Field(default=None)
+    # STARTTLS. Both must be set to enable TLS upgrade. Paths are read
+    # once at process start; restart the container after cert renewal.
+    tls_cert: Optional[str] = Field(default=None)
+    tls_key: Optional[str] = Field(default=None)
 
     # Logging settings
     log_level: str = Field(default="INFO")
     log_json: bool = Field(default=False)
+    # Prometheus metrics. metrics_port unset (None) disables the /metrics
+    # endpoint. metrics_bind defaults to loopback: the exposition names the
+    # honeypot software and version, so it must never be reachable from the
+    # same networks the SMTP listener is exposed to. Set it to 0.0.0.0 or ::
+    # only when scraping from another host or container, and keep the port
+    # unpublished or bound to a private interface.
+    metrics_port: Optional[int] = Field(default=None)
+    metrics_bind: str = Field(default="127.0.0.1")
     
     # Configure the settings to use the MAILONEY_ prefix for environment variables
     model_config = SettingsConfigDict(
@@ -92,7 +105,7 @@ def configure_logging(
         if type(handler) is logging.StreamHandler:
             root.removeHandler(handler)
 
-    handler = logging.StreamHandler()
+    handler = logging.StreamHandler(sys.stdout)
     if json_format:
         handler.setFormatter(JsonOperationalFormatter())
     else:

@@ -15,6 +15,13 @@ from sqlalchemy.pool import NullPool
 Base = declarative_base()
 engine = None
 Session = None
+# True only after an explicit opt-out (``init_db("")`` / ``MAILONEY_DB_URL=``).
+# Distinguishes "operator disabled the database" from "nobody called
+# init_db() yet": the former makes the write helpers no-ops, the latter
+# keeps the legacy behaviour of initialising lazily on first use, so a
+# library caller that skips init_db() still persists rather than silently
+# losing every session.
+_db_disabled = False
 logger = logging.getLogger(__name__)
 
 class SMTPSession(Base):
@@ -58,7 +65,7 @@ def init_db(db_url: Optional[str] = None) -> None:
               unaffected.
             - any other value: SQLAlchemy connection URL.
     """
-    global engine, Session
+    global engine, Session, _db_disabled
 
     if db_url is None:
         env_val = os.environ.get("MAILONEY_DB_URL")
@@ -73,8 +80,11 @@ def init_db(db_url: Optional[str] = None) -> None:
     if db_url == "":
         engine = None
         Session = None
+        _db_disabled = True
         logger.info("Database disabled (MAILONEY_DB_URL is empty); events go to logs only")
         return
+
+    _db_disabled = False
 
     logger.info(f"Initializing database with URL: {db_url}")
     
@@ -124,7 +134,21 @@ def init_db(db_url: Optional[str] = None) -> None:
 
 def is_db_enabled() -> bool:
     """Return True if a database connection has been configured."""
-    return Session is not None
+    return Session is not None and not _db_disabled
+
+
+def _ensure_session() -> bool:
+    """Make sure a database session factory exists, unless explicitly disabled.
+
+    Returns False when the operator opted out via ``init_db("")``. Otherwise
+    lazily runs ``init_db()`` if nothing has configured the database yet
+    (legacy behaviour) and returns True.
+    """
+    if Session is None:
+        if _db_disabled:
+            return False
+        init_db()
+    return True
 
 
 def create_session(
@@ -153,7 +177,7 @@ def create_session(
     """
     global engine, Session
 
-    if Session is None:
+    if not _ensure_session():
         return SMTPSession(
             ip_address=ip_address,
             port=port,
@@ -213,7 +237,7 @@ def update_session_data(session_id: Optional[int], session_data: str) -> None:
         session_id: The ID of the session to update.
         session_data: Session data to store.
     """
-    if Session is None or session_id is None:
+    if session_id is None or not _ensure_session():
         return
 
     session = Session()
@@ -243,7 +267,7 @@ def log_credential(session_id: Optional[int], auth_string: str) -> None:
         session_id: The ID of the session.
         auth_string: The authentication string.
     """
-    if Session is None or session_id is None:
+    if session_id is None or not _ensure_session():
         return
 
     session = Session()

@@ -15,6 +15,8 @@ def test_default_settings():
     assert settings.db_url == "sqlite:///mailoney.db"
     assert settings.log_level == "INFO"
     assert settings.log_json is False
+    assert settings.metrics_port is None
+    assert settings.metrics_bind == "127.0.0.1"
 
 
 def test_empty_db_url_env_disables_db(monkeypatch):
@@ -28,6 +30,14 @@ def test_log_json_env(monkeypatch):
     monkeypatch.setenv("MAILONEY_LOG_JSON", "true")
     settings = Settings()
     assert settings.log_json is True
+
+
+def test_metrics_env(monkeypatch):
+    monkeypatch.setenv("MAILONEY_METRICS_PORT", "9025")
+    monkeypatch.setenv("MAILONEY_METRICS_BIND", "127.0.0.1")
+    settings = Settings()
+    assert settings.metrics_port == 9025
+    assert settings.metrics_bind == "127.0.0.1"
 
 def test_env_settings(monkeypatch):
     """Test settings from environment variables"""
@@ -66,7 +76,8 @@ def test_configure_logging_json_format_switches_root_formatter():
 
     configure_logging("INFO", json_format=True)
     root = _logging.getLogger()
-    handler = next(h for h in root.handlers if isinstance(h, _logging.StreamHandler))
+    # Plain StreamHandler only: pytest's capture handlers subclass it.
+    handler = next(h for h in root.handlers if type(h) is _logging.StreamHandler)
     saved_stream = handler.stream
     handler.stream = io.StringIO()
     try:
@@ -83,3 +94,26 @@ def test_configure_logging_json_format_switches_root_formatter():
     assert payload["logger"] == "mailoney.core"
     assert payload["level"] == "INFO"
     assert payload["message"] == "hello world"
+
+
+def test_configure_logging_writes_to_stdout():
+    """Operational records go to stdout (documented contract for shippers)."""
+    import logging as _logging
+    import sys as _sys
+    configure_logging("INFO", json_format=False)
+    handler = next(h for h in _logging.getLogger().handlers if type(h) is _logging.StreamHandler)
+    assert handler.stream is _sys.stdout
+
+
+def test_configure_logging_keeps_file_handlers(tmp_path):
+    """Re-configuring must not drop a user-installed FileHandler."""
+    import logging as _logging
+    root = _logging.getLogger()
+    fh = _logging.FileHandler(tmp_path / "ops.log")
+    root.addHandler(fh)
+    try:
+        configure_logging("INFO", json_format=False)
+        assert fh in root.handlers
+    finally:
+        root.removeHandler(fh)
+        fh.close()

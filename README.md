@@ -116,8 +116,12 @@ python main.py
 | `MAILONEY_CONN_TIMEOUT` | Per-connection inactivity timeout (seconds). A client that sends nothing for this long is dropped, so slow-loris connections cannot pin handler threads. `0` disables it. | 30 |
 | `MAILONEY_DB_URL` | Database connection URL. Set to an empty string (`MAILONEY_DB_URL=`) to disable the database and run in event-logging-only mode. | sqlite:///mailoney.db |
 | `MAILONEY_MAIL_DIR` | When set, captured SMTP message bodies are written under this directory as `<YYYY-MM-DD>/<src-ip>/<session>.eml` and the session log records the relative path. Unset = bodies are discarded after their metadata (size, truncated flag) is recorded. Operators opt *in* to body retention. | (unset) |
+| `MAILONEY_TLS_CERT` | Path to a PEM cert/chain. Both `MAILONEY_TLS_CERT` and `MAILONEY_TLS_KEY` must be set to enable STARTTLS. | (unset) |
+| `MAILONEY_TLS_KEY` | Path to the PEM private key matching `MAILONEY_TLS_CERT`. | (unset) |
 | `MAILONEY_LOG_LEVEL` | Logging level | INFO |
 | `MAILONEY_LOG_JSON` | When `true`, every log line on stdout — both honeypot events (session start/end, captured credentials) and operational records (`mailoney.core`, `mailoney.mail_storage`, …) — is emitted as JSON Lines. Default emits human-readable text for both. | false |
+| `MAILONEY_METRICS_PORT` | Port for the Prometheus `/metrics` endpoint. Unset disables the endpoint. | (unset) |
+| `MAILONEY_METRICS_BIND` | Bind address for the metrics endpoint. Loopback by default; set `0.0.0.0` or `::` only to scrape from another host/container, and keep that port off public interfaces (see [Prometheus Metrics](#prometheus-metrics)). | `127.0.0.1` |
 
 ### Running without a database
 
@@ -137,11 +141,26 @@ When the database is disabled:
 - No tables are created, no migrations are run, no DB driver is required at
   runtime.
 - Per-session events (`session_started`, `credential_captured`,
-  `session_ended`) are emitted to the `mailoney.events` logger.
-- `session_ended` carries a per-session summary — source/destination,
-  duration, command list, last response code, and any captured
-  credentials. Text mode drops the command and credential lists for
-  readability; JSON mode keeps them.
+  `session_ended`) are emitted to the `mailoney.events` logger. These are
+  emitted whether or not the database is enabled; the database is simply
+  one more sink.
+
+`session_ended` carries a per-session **summary**, not the transcript:
+source/destination, `duration_seconds`, `command_count`, the `commands`
+list (capped at 200 entries, with `commands_truncated: true` beyond that),
+`last_response_code`, `outcome` (`ok` / `error` / `timeout`), and, when
+present, `credentials`, `mail` (per-DATA size/truncation/path metadata),
+`mail_size`, `tls_version`, `tls_error` and `timed_out`. Message bodies are
+never inlined. Text mode drops the command and credential lists for
+readability; JSON mode keeps them.
+
+When the database **is** enabled, it keeps storing the full per-command
+transcript in `smtp_sessions.session_data` exactly as before — the summary
+does not replace it.
+
+With `MAILONEY_LOG_JSON=true`, **stdout** is JSON Lines only; the startup
+banner and `[*]` status lines go to stderr, so a shipper attached to stdout
+never sees a non-JSON line.
 
 ### Command-line Arguments
 
@@ -158,8 +177,12 @@ Available arguments:
 - `--conn-timeout`: Per-connection inactivity timeout in seconds (0 disables it)
 - `-d`, `--db-url`: Database URL. Pass an empty string to disable the database.
 - `--mail-dir`: Directory under which captured message bodies are written
+- `--tls-cert`: Path to a PEM cert/chain (enables STARTTLS together with --tls-key)
+- `--tls-key`: Path to the PEM private key matching --tls-cert
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 - `--log-json`: Emit honeypot events as JSON Lines instead of human-readable text.
+- `--metrics-port`: Port for the Prometheus `/metrics` endpoint (unset = disabled)
+- `--metrics-bind`: Bind address for the metrics endpoint (default: `127.0.0.1`, loopback only)
 
 ### Captured mail bodies
 
@@ -201,6 +224,227 @@ postgresql://username:password@hostname:port/database
 ```
 mysql+pymysql://username:password@hostname:port/database
 ```
+
+## STARTTLS
+
+Mailoney supports the SMTP `STARTTLS` extension when both
+`MAILONEY_TLS_CERT` and `MAILONEY_TLS_KEY` are set. Any cert/key pair
+works — the server presents the cert and never verifies anything, so a
+self-signed cert is perfectly adequate for a honeypot.
+
+When unconfigured, `EHLO` does not advertise `STARTTLS`, and an explicit
+`STARTTLS` command from a client gets `454 4.7.0 TLS not available`.
+
+### A note on file permissions
+
+The container image runs as the unprivileged `mailoney` user, and
+private keys are root-owned and mode `0600`/`0640` almost everywhere
+they are generated. Bind-mounting `/etc/letsencrypt` or `/etc/ssl`
+straight into the container therefore does **not** work on its own —
+the process cannot read the key.
+
+Mailoney checks this at startup and exits with status 2 and an explicit
+message rather than failing later at handshake time:
+
+```
+[!] STARTTLS: TLS key is not readable: /etc/letsencrypt/live/mx.example.com/privkey.pem
+```
+
+Two ways to resolve it, in order of preference:
+
+1. **Copy the pair to a location the container user can read** (below).
+2. **Pin the container to a known UID** with `user:` in compose, and
+   `chown` the copied files to it.
+
+Running the container as root also works but gives up the image's
+privilege separation, which is a poor trade for a service that
+deliberately accepts hostile input on port 25.
+
+### Self-signed certificate
+
+Generate a throwaway pair:
+
+```bash
+mkdir -p ./tls
+openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+  -keyout ./tls/privkey.pem -out ./tls/fullchain.pem \
+  -subj "/CN=mx.example.com"
+chmod 640 ./tls/privkey.pem
+```
+
+On Debian/Ubuntu the `ssl-cert` package's *snakeoil* pair works too, but
+it lives in `/etc/ssl/private` (mode `0710`, group `ssl-cert`) and the
+key is `0640 root:ssl-cert`, so copy it out rather than mounting it:
+
+```bash
+mkdir -p ./tls
+sudo install -m 0644 /etc/ssl/certs/ssl-cert-snakeoil.pem ./tls/fullchain.pem
+sudo install -m 0640 /etc/ssl/private/ssl-cert-snakeoil.key ./tls/privkey.pem
+sudo chown -R 1000:1000 ./tls
+```
+
+Either way, mount the directory and pin the user:
+
+```yaml
+services:
+  mailoney:
+    image: ghcr.io/phin3has/mailoney:latest
+    user: "1000:1000"
+    ports:
+      - "25:25"
+    environment:
+      - MAILONEY_TLS_CERT=/tls/fullchain.pem
+      - MAILONEY_TLS_KEY=/tls/privkey.pem
+    volumes:
+      - ./tls:/tls:ro
+```
+
+### Let's Encrypt / certbot
+
+Certbot writes `privkey.pem` as `0600 root:root`, so the honeypot
+container cannot read it from a bind mount. Use a **deploy hook** to
+publish a readable copy on every renewal, then restart the container so
+the new cert is picked up:
+
+```bash
+# /etc/letsencrypt/renewal-hooks/deploy/mailoney.sh   (chmod +x)
+#!/bin/sh
+set -eu
+DEST=/srv/mailoney/tls
+install -d -m 0750 -o 1000 -g 1000 "$DEST"
+install -m 0644 -o 1000 -g 1000 "$RENEWED_LINEAGE/fullchain.pem" "$DEST/fullchain.pem"
+install -m 0640 -o 1000 -g 1000 "$RENEWED_LINEAGE/privkey.pem"   "$DEST/privkey.pem"
+docker compose -f /srv/mailoney/docker-compose.yml restart mailoney
+```
+
+`$RENEWED_LINEAGE` is set by certbot to the `live/<domain>` directory
+being renewed, so the hook needs no per-domain editing. It runs on
+issuance and on every successful renewal.
+
+```yaml
+services:
+  mailoney:
+    image: ghcr.io/phin3has/mailoney:latest
+    user: "1000:1000"
+    ports:
+      - "25:25"
+    environment:
+      - MAILONEY_TLS_CERT=/tls/fullchain.pem
+      - MAILONEY_TLS_KEY=/tls/privkey.pem
+    volumes:
+      - /srv/mailoney/tls:/tls:ro
+```
+
+Using a real cert for a honeypot is a deliberate choice: it makes the
+listener look like production infrastructure, at the cost of tying a
+domain you control to it (and publishing the hostname in the
+Certificate Transparency logs). A self-signed cert leaks nothing but is
+a fingerprintable signal in itself. Neither is wrong — pick per
+deployment.
+
+### Behaviour
+
+- The `EHLO` response advertises `STARTTLS`. After a successful upgrade,
+  the post-TLS `EHLO` drops the line per RFC 3207 §4.2.
+- The handshake is pinned to TLS 1.2 minimum.
+- A 10-second handshake timeout protects against half-open clients; the
+  per-connection inactivity timeout is restored afterwards, so an
+  upgraded connection is bounded exactly like a plaintext one.
+- The upgrade is recorded in the session log as a `tls-upgrade` entry
+  carrying the negotiated version.
+- A repeat `STARTTLS` on an encrypted connection gets
+  `503 5.5.1 STARTTLS already active`.
+- Cert and key are loaded **once at process start**. Restart the
+  container after a renewal — hence the `restart` in the deploy hook
+  above.
+
+### Startup validation
+
+TLS configuration is checked before the database is touched, so a cert
+problem never surfaces as a database error:
+
+| Condition | Behaviour |
+|---|---|
+| Neither cert nor key set | STARTTLS disabled, no message (the default) |
+| Only one of the two set | Warning on stderr; server starts, plaintext only |
+| Path missing | `exit 2`, names the missing file |
+| Path unreadable | `exit 2`, names the file and the likely cause |
+| Cert/key mismatch, malformed PEM | `exit 2`, reports the OpenSSL error |
+
+## Prometheus Metrics
+
+Mailoney can expose a `/metrics` endpoint for Prometheus scraping when
+`MAILONEY_METRICS_PORT` is set (or `--metrics-port` is passed).
+
+> **Keep this endpoint off the internet.** The exposition is unauthenticated,
+> is served on every path, and includes `mailoney_build_info` — the software
+> name and version. Anyone who can reach it learns in one request that the
+> "mail server" is a honeypot. The endpoint therefore binds to loopback
+> (`127.0.0.1`) by default, and Mailoney logs a warning at startup whenever
+> it is bound anywhere else.
+
+Running directly on the host, the default just works and Prometheus on the
+same machine scrapes `127.0.0.1:9025`:
+
+```bash
+MAILONEY_METRICS_PORT=9025 python main.py
+```
+
+In Docker, port publishing forwards to the container's network interface,
+not its loopback, so the container-side bind must be widened to `0.0.0.0`
+(or `::`) and the exposure controlled on the Docker side instead. Two safe
+patterns:
+
+**Scrape over an internal network, publish nothing.** Prometheus and
+Mailoney share a compose network; only port 25 reaches the outside:
+
+```yaml
+services:
+  mailoney:
+    image: ghcr.io/phin3has/mailoney:latest
+    ports:
+      - "25:25"                     # only the honeypot port is published
+    environment:
+      - MAILONEY_METRICS_PORT=9025
+      - MAILONEY_METRICS_BIND=0.0.0.0
+    networks: [monitoring]
+
+  prometheus:
+    image: prom/prometheus
+    networks: [monitoring]          # scrapes http://mailoney:9025/metrics
+
+networks:
+  monitoring:
+```
+
+**Publish to the host's loopback only.** For a Prometheus that runs on the
+Docker host itself:
+
+```bash
+docker run -p 25:25 -p 127.0.0.1:9025:9025 \
+  -e MAILONEY_METRICS_PORT=9025 \
+  -e MAILONEY_METRICS_BIND=0.0.0.0 \
+  ghcr.io/phin3has/mailoney:latest
+```
+
+Never use a bare `-p 9025:9025` on an internet-facing host: that publishes
+the fingerprint on every interface.
+
+Exposed metrics:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `mailoney_smtp_connections_total` | Counter | — | SMTP connections accepted. |
+| `mailoney_smtp_sessions_total` | Counter | `result` (`ok`/`error`/`timeout`) | SMTP sessions that ran to completion. `timeout` is an inactivity drop, reported separately so slow-loris pressure is visible. |
+| `mailoney_smtp_credentials_captured_total` | Counter | — | AUTH PLAIN credentials captured. |
+| `mailoney_smtp_commands_total` | Counter | `command` | SMTP commands by verb (`ehlo`, `helo`, `auth`, `starttls`, `mail`, `rcpt`, `data`, `quit`, `unknown`). |
+| `mailoney_smtp_active_sessions` | Gauge | — | Sessions currently in flight. |
+| `mailoney_smtp_session_duration_seconds` | Histogram | — | Time from accept to close, per session. |
+| `mailoney_smtp_banner_only_sessions_total` | Counter | — | Sessions where the client connected but never sent a command (port-scanner signal). |
+| `mailoney_start_time_seconds` | Gauge | — | Unix timestamp at process start. Compute uptime in PromQL with `time() - mailoney_start_time_seconds`. |
+| `mailoney_build_info` | Info | `version` | Mailoney build/version info. |
+
+`MAILONEY_METRICS_BIND` (or `--metrics-bind`) overrides the bind address.
 
 ## Database Schema
 

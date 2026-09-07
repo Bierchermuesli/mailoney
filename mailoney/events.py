@@ -25,6 +25,7 @@ import contextlib
 import contextvars
 import json
 import logging
+import sys
 from typing import Any, Dict, Iterator, Optional
 
 EVENT_LOGGER_NAME = "mailoney.events"
@@ -135,7 +136,7 @@ def init_event_logging(json_format: bool = False) -> None:
     """Configure the events logger. Safe to call multiple times."""
     for handler in list(_logger.handlers):
         _logger.removeHandler(handler)
-    handler = logging.StreamHandler()
+    handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonEventFormatter() if json_format else TextEventFormatter())
     _logger.addHandler(handler)
     _logger.setLevel(logging.INFO)
