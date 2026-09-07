@@ -8,7 +8,6 @@ is passed).
 """
 import logging
 import time
-from typing import Optional
 
 from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
 
