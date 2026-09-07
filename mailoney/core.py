@@ -19,6 +19,7 @@ from .db import create_session, update_session_data, log_credential, init_db
 from .config import get_settings, configure_logging
 from .mail_storage import store_mail_body
 from . import metrics
+from . import events
 
 class TLSConfigError(Exception):
     """Raised when the configured TLS cert/key pair cannot be used."""
@@ -48,6 +49,11 @@ _DATA_TERMINATOR_TAIL = 4
 # without it a slow-loris client pins threads indefinitely. A value <= 0
 # disables the timeout.
 DEFAULT_CONN_TIMEOUT = 30
+
+# Cap on the number of command lines carried in the session_ended event.
+# The count keeps going past this; only the list stops growing, so a
+# client that pipes thousands of EHLOs cannot inflate a single log line.
+MAX_LOGGED_COMMANDS = 200
 
 class SMTPHoneypot:
     """
@@ -171,7 +177,7 @@ class SMTPHoneypot:
             )
             
             logger.info(f"SMTP Honeypot listening on {self.bind_ip}:{self.bind_port}")
-            print(f"[*] SMTP Honeypot listening on {self.bind_ip}:{self.bind_port}")
+            print(f"[*] SMTP Honeypot listening on {self.bind_ip}:{self.bind_port}", file=sys.stderr)
             
             self._accept_connections()
         except Exception as e:
@@ -188,7 +194,7 @@ class SMTPHoneypot:
             try:
                 client, addr = self.socket.accept()
                 logger.info(f"Connection from {addr[0]}:{addr[1]} to {self.bind_ip}:{self.bind_port}")
-                print(f"[*] Connection from {addr[0]}:{addr[1]} to {self.bind_ip}:{self.bind_port}")
+                print(f"[*] Connection from {addr[0]}:{addr[1]} to {self.bind_ip}:{self.bind_port}", file=sys.stderr)
                 
                 client_handler = threading.Thread(
                     target=self._handle_client,
@@ -242,23 +248,64 @@ class SMTPHoneypot:
 
     def _handle_client(self, client_socket: socket.socket, addr: Tuple[str, int]) -> None:
         """
-        Handle client connection
+        Handle client connection.
+
+        Binds the session UUID to the current execution context so every
+        operational log record emitted from this thread carries it, then
+        runs the SMTP conversation in ``_run_session``.
 
         Args:
             client_socket: Client socket
             addr: Client address tuple (ip, port)
         """
         session_uuid = str(uuid.uuid4())
+        with events.session_context(session_uuid):
+            self._run_session(client_socket, addr, session_uuid)
+
+    def _run_session(
+        self,
+        client_socket: socket.socket,
+        addr: Tuple[str, int],
+        session_uuid: str,
+    ) -> None:
+        """
+        Run one SMTP conversation to completion.
+
+        Two records come out of every session:
+
+        * the per-command transcript (``session_log``), stored in the
+          database exactly as before, and
+        * a flat summary (commands, credentials, mail metadata, outcome)
+          emitted as a ``session_ended`` event for log shippers. The
+          summary never carries message bodies.
+        """
         metrics.CONNECTIONS_TOTAL.inc()
         metrics.ACTIVE_SESSIONS.inc()
-        session_started = time.monotonic()
+        session_started_at = time.monotonic()
         session_outcome = "ok"
-        session_record = create_session(
-            addr[0], addr[1], self.server_name,
-            dest_ip=self.bind_ip,
-            dest_port=self.bind_port
-        )
+        session_record = None
         session_log = []
+
+        events.session_started(
+            session_uuid=session_uuid,
+            src_ip=addr[0],
+            src_port=addr[1],
+            server_name=self.server_name,
+            dest_ip=self.bind_ip,
+            dest_port=self.bind_port,
+        )
+
+        # Summary state. ``commands`` is capped so a chatty client cannot
+        # inflate the session_ended event without bound; ``command_count``
+        # keeps counting past the cap.
+        commands: List[str] = []
+        command_count = 0
+        commands_truncated = False
+        credentials: List[str] = []
+        mail: List[Dict[str, Any]] = []
+        last_response_code: Optional[int] = None
+        tls_version: Optional[str] = None
+        tls_error: Optional[str] = None
 
         # Bound the lifetime of an idle connection. With a timeout set,
         # recv()/send() raise socket.timeout after this many seconds of
@@ -269,11 +316,31 @@ class SMTPHoneypot:
             client_socket.settimeout(self.conn_timeout)
         tls_active = False
 
+        def send(response: str) -> None:
+            """Send a reply, record it in the transcript, track its code.
+
+            Reads ``client_socket`` from the enclosing scope at call time,
+            so it follows the rebinding to the SSLSocket after STARTTLS.
+            """
+            nonlocal last_response_code
+            client_socket.send(response.encode())
+            session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+            try:
+                last_response_code = int(response[:3])
+            except ValueError:
+                pass
+
         try:
+            # Inside the try so a database failure here still reaches the
+            # finally block (metrics, session_ended event, socket close).
+            session_record = create_session(
+                addr[0], addr[1], self.server_name,
+                dest_ip=self.bind_ip,
+                dest_port=self.bind_port
+            )
+
             # Send banner
-            banner = f"220 {self.server_name} ESMTP Service Ready\n"
-            client_socket.send(banner.encode())
-            session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": banner})
+            send(f"220 {self.server_name} ESMTP Service Ready\n")
 
             # Handle client commands
             error_count = 0
@@ -284,6 +351,11 @@ class SMTPHoneypot:
                         break
 
                     session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "in", "data": request})
+                    command_count += 1
+                    if len(commands) < MAX_LOGGED_COMMANDS:
+                        commands.append(request)
+                    else:
+                        commands_truncated = True
                     logger.debug(f"Client: {request}")
                     metrics.COMMANDS_TOTAL.labels(
                         command=metrics.classify_command(request)
@@ -292,27 +364,19 @@ class SMTPHoneypot:
                     # Handle EHLO/HELO. Use the post-TLS variant once a
                     # STARTTLS upgrade has succeeded (no STARTTLS line).
                     if request.startswith('ehlo') or request.startswith('helo'):
-                        ehlo = self.ehlo_response_post_tls if tls_active else self.ehlo_response
-                        client_socket.send(ehlo.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": ehlo})
+                        send(self.ehlo_response_post_tls if tls_active else self.ehlo_response)
                         error_count = 0
 
                     # STARTTLS — upgrade the connection in place.
                     elif request.startswith('starttls'):
                         if self.tls_context is None:
-                            response = "454 4.7.0 TLS not available\n"
-                            client_socket.send(response.encode())
-                            session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                            send("454 4.7.0 TLS not available\n")
                             error_count += 1
                         elif tls_active:
-                            response = "503 5.5.1 STARTTLS already active\n"
-                            client_socket.send(response.encode())
-                            session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                            send("503 5.5.1 STARTTLS already active\n")
                             error_count += 1
                         else:
-                            response = "220 2.0.0 Ready to start TLS\n"
-                            client_socket.send(response.encode())
-                            session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                            send("220 2.0.0 Ready to start TLS\n")
                             try:
                                 client_socket.settimeout(TLS_HANDSHAKE_TIMEOUT_SECONDS)
                                 client_socket = self.tls_context.wrap_socket(
@@ -329,11 +393,13 @@ class SMTPHoneypot:
                                     else None
                                 )
                                 tls_active = True
-                                session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "tls-upgrade", "tls_version": client_socket.version()})
+                                tls_version = client_socket.version()
+                                session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "tls-upgrade", "tls_version": tls_version})
                                 error_count = 0
                             except (ssl.SSLError, OSError, socket.timeout) as e:
                                 logger.warning(f"TLS handshake failed for {addr[0]}:{addr[1]}: {e}")
-                                session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "tls-failed", "error": str(e)})
+                                tls_error = str(e)
+                                session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "tls-failed", "error": tls_error})
                                 break
 
                     # Handle AUTH
@@ -343,39 +409,33 @@ class SMTPHoneypot:
                         if len(parts) >= 3:
                             auth_string = parts[2]
                             metrics.CREDENTIALS_CAPTURED_TOTAL.inc()
+                            credentials.append(auth_string)
+                            events.credential_captured(session_uuid, auth_string)
                             log_credential(session_record.id, auth_string)
                             logger.info(f"Captured credential: {auth_string}")
 
-                        response = "235 2.7.0 Authentication failed\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                        send("235 2.7.0 Authentication failed\n")
 
                     # Handle QUIT
                     elif request.startswith('quit'):
-                        response = "221 2.0.0 Goodbye\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                        send("221 2.0.0 Goodbye\n")
                         break
-                        
+
                     # MAIL FROM: / RCPT TO: — accept envelope, no body involved.
                     elif request.startswith(('mail from:', 'rcpt to:')):
-                        response = "250 2.1.0 OK\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                        send("250 2.1.0 OK\n")
                         error_count = 0
 
                     # DATA — enter body-receive mode, read until terminator
                     # or size cap, then return to command mode.
                     elif request.startswith('data'):
-                        invitation = "354 End data with <CR><LF>.<CR><LF>\n"
-                        client_socket.send(invitation.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": invitation})
+                        send("354 End data with <CR><LF>.<CR><LF>\n")
 
                         body, terminator_found = self._receive_mail_body(client_socket.recv)
 
-                        body_entry: Dict[str, Any] = {
-                            "timestamp": strftime("%Y-%m-%d %H:%M:%S"),
-                            "direction": "mail-body",
+                        # Metadata only; the same dict feeds the transcript
+                        # entry and the summary's ``mail`` list.
+                        body_meta: Dict[str, Any] = {
                             "size": len(body),
                             "truncated": not terminator_found,
                         }
@@ -384,21 +444,26 @@ class SMTPHoneypot:
                                 rel_path = store_mail_body(
                                     self.mail_dir, addr[0], session_uuid, body,
                                 )
-                                body_entry["body_path"] = rel_path
+                                body_meta["body_path"] = rel_path
                             except OSError as e:
                                 # Body storage was requested but failed. Log
                                 # the underlying error and surface it on the
                                 # record; do NOT inline the body bytes here —
                                 # if the operator set MAIL_DIR they
                                 # explicitly chose not to keep bodies in the
-                                # log/DB stream, and an error path should not
-                                # silently override that.
+                                # log/DB/event stream, and an error path
+                                # should not silently override that.
                                 logger.error(f"Failed to write mail body: {e}")
-                                body_entry["body_path_error"] = str(e)
+                                body_meta["body_path_error"] = str(e)
                         # If self.mail_dir is unset, only metadata (size,
                         # truncated) is retained. Operators opt in to body
                         # retention by setting MAIL_DIR.
-                        session_log.append(body_entry)
+                        session_log.append({
+                            "timestamp": strftime("%Y-%m-%d %H:%M:%S"),
+                            "direction": "mail-body",
+                            **body_meta,
+                        })
+                        mail.append(body_meta)
 
                         if terminator_found:
                             response = "250 2.0.0 Ok\n"
@@ -408,19 +473,16 @@ class SMTPHoneypot:
                             # Peer closed mid-body. Connection is effectively gone;
                             # send a polite close and break.
                             response = "421 4.4.2 Connection closed\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                        send(response)
                         if not terminator_found:
                             break
                         error_count = 0
 
                     # Unknown command
                     else:
-                        response = "502 5.5.2 Error: command not recognized\n"
-                        client_socket.send(response.encode())
-                        session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": response})
+                        send("502 5.5.2 Error: command not recognized\n")
                         error_count += 1
-                        
+
                 except socket.timeout:
                     # Idle longer than conn_timeout. Drop the connection
                     # so the handler thread is freed; the 421 reply is
@@ -429,12 +491,10 @@ class SMTPHoneypot:
                         f"Connection from {addr[0]}:{addr[1]} timed out after "
                         f"{self.conn_timeout}s of inactivity"
                     )
-                    timeout_reply = "421 4.4.2 Connection timed out\n"
                     try:
-                        client_socket.send(timeout_reply.encode())
+                        send("421 4.4.2 Connection timed out\n")
                     except OSError:
                         pass
-                    session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": timeout_reply})
                     # Distinct from "ok": an idle drop is not a session
                     # that ran to completion, and operators watching the
                     # metric want slow-loris pressure to be visible.
@@ -445,24 +505,62 @@ class SMTPHoneypot:
                     logger.error(f"Error handling client request: {e}")
                     error_count += 1
 
-            # Store the session log
-            update_session_data(session_record.id, json.dumps(session_log))
-
         except Exception as e:
             logger.error(f"Error in client handler: {e}")
             session_outcome = "error"
         finally:
+            duration = time.monotonic() - session_started_at
             metrics.SESSIONS_TOTAL.labels(result=session_outcome).inc()
-            metrics.SESSION_DURATION_SECONDS.observe(time.monotonic() - session_started)
-            if not any(entry.get("direction") == "in" for entry in session_log):
+            metrics.SESSION_DURATION_SECONDS.observe(duration)
+            if command_count == 0:
                 metrics.BANNER_ONLY_SESSIONS_TOTAL.inc()
             metrics.ACTIVE_SESSIONS.dec()
+
+            summary: Dict[str, Any] = {
+                "src_ip": addr[0],
+                "src_port": addr[1],
+                "dest_ip": self.bind_ip,
+                "dest_port": self.bind_port,
+                "duration_seconds": round(duration, 3),
+                "command_count": command_count,
+                "commands": commands,
+                "last_response_code": last_response_code,
+                "outcome": session_outcome,
+            }
+            if commands_truncated:
+                summary["commands_truncated"] = True
+            if session_outcome == "timeout":
+                summary["timed_out"] = True
+            if tls_version is not None:
+                summary["tls_version"] = tls_version
+            if tls_error is not None:
+                summary["tls_error"] = tls_error
+            if credentials:
+                summary["credentials"] = credentials
+            if mail:
+                summary["mail"] = mail
+                # Flat total so log queries (e.g. the Grafana dashboard's
+                # "sessions with mail body" panel) can filter on it; nested
+                # arrays are opaque to Loki's ``| json``.
+                summary["mail_size"] = sum(m["size"] for m in mail)
+            events.session_ended(session_uuid=session_uuid, summary=summary)
+
+            # Store the transcript. Runs on every exit path (quit, timeout,
+            # error) and must never prevent the socket from being closed.
+            try:
+                update_session_data(
+                    session_record.id if session_record is not None else None,
+                    json.dumps(session_log),
+                )
+            except Exception as e:
+                logger.error(f"Failed to store session log: {e}")
+
             try:
                 client_socket.close()
             except OSError:
                 pass
             logger.info(f"Connection closed for {addr[0]}:{addr[1]} (dest: {self.bind_ip}:{self.bind_port})")
-            
+
     def stop(self) -> None:
         """
         Stop the SMTP honeypot server
@@ -503,7 +601,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '-d', '--db-url',
         default=get_settings().db_url,
-        help='Database URL (default: sqlite:///mailoney.db)'
+        help=(
+            'Database URL (default: sqlite:///mailoney.db). '
+            'Pass an empty string to disable the database and run in '
+            'event-logging-only mode.'
+        )
     )
 
     parser.add_argument(
@@ -547,6 +649,17 @@ def parse_args() -> argparse.Namespace:
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
         default=get_settings().log_level,
         help='Log level'
+    )
+
+    parser.add_argument(
+        '--log-json',
+        action='store_true',
+        default=get_settings().log_json,
+        help=(
+            'Emit every log line — both honeypot events and operational '
+            'records — as JSON Lines on stdout. Default is human-readable '
+            'text for both.'
+        )
     )
 
     parser.add_argument(
@@ -636,7 +749,7 @@ def display_banner() -> None:
     *    Mailoney - A Simple SMTP Honeypot - Version: {__version__}    *
     ****************************************************************
     """
-    print(banner)
+    print(banner, file=sys.stderr)
 
 
 def run_server() -> None:
@@ -647,18 +760,30 @@ def run_server() -> None:
     # Parse command-line arguments
     args = parse_args()
     
-    # Configure logging
-    configure_logging(args.log_level)
-    
-    # Display banner
+    # Configure logging. The same flag drives both the operational
+    # (root) logger and the events logger so the entire stdout stream
+    # is uniformly text or uniformly JSON.
+    configure_logging(args.log_level, json_format=args.log_json)
+    events.init_event_logging(json_format=args.log_json)
+
+    # Display banner (stderr, so stdout stays machine-readable)
     display_banner()
 
     # Validate TLS config before touching the database (see preflight_tls).
     preflight_tls(args.tls_cert, args.tls_key)
 
-    # Initialize database
-    logger.info(f"Initializing database with URL: {args.db_url}")
+    # Initialize database (empty URL disables it; events still flow to logs).
+    if args.db_url == "":
+        logger.info("Database disabled; running in event-logging-only mode")
+    else:
+        logger.info(f"Initializing database with URL: {args.db_url}")
     init_db(args.db_url)
+
+    # Alembic's fileConfig() runs inside init_db while applying migrations
+    # and installs alembic.ini's own console handler on the root logger,
+    # displacing the formatter chosen above. Re-apply it so JSON mode
+    # survives a migration run.
+    configure_logging(args.log_level, json_format=args.log_json)
 
     # Start Prometheus /metrics endpoint if requested
     if args.metrics_port:

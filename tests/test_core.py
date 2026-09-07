@@ -108,3 +108,104 @@ def test_idle_connection_times_out():
         pass
     assert b"421" in tail
     client_sock.close()
+
+
+# --- session summary vs. transcript -----------------------------------
+#
+# Every session produces two records: the per-command transcript that goes
+# to the database (unchanged shape), and a flat summary emitted as the
+# session_ended event. These tests drive the handler with a mock socket
+# and check both.
+
+import json
+from mailoney import metrics
+
+
+def _mock_socket(*chunks):
+    sock = MagicMock(spec=socket.socket)
+    sock.recv.side_effect = list(chunks) + [b""]
+    sock.send.side_effect = lambda b: len(b)
+    return sock
+
+
+def _session_ended(read_events):
+    ended = [e for e in read_events() if e["event"] == "session_ended"]
+    assert len(ended) == 1
+    return ended[0]
+
+
+def test_full_session_summary_and_transcript(event_stream):
+    stored = {}
+    sock = _mock_socket(
+        b"EHLO probe\r\n",
+        b"AUTH PLAIN dGVzdA==\r\n",
+        b"MAIL FROM:<a@b.test>\r\n",
+        b"RCPT TO:<c@d.test>\r\n",
+        b"DATA\r\n",
+        b"Subject: hi\r\n\r\nhello\r\n.\r\n",
+        b"QUIT\r\n",
+    )
+    h = SMTPHoneypot(bind_ip="127.0.0.1", bind_port=8025)
+    with patch("mailoney.core.update_session_data",
+               side_effect=lambda sid, data: stored.update(id=sid, data=data)):
+        h._handle_client(sock, ("10.0.0.1", 4444))
+
+    s = _session_ended(event_stream)
+    assert s["src_ip"] == "10.0.0.1" and s["src_port"] == 4444
+    assert s["dest_ip"] == "127.0.0.1" and s["dest_port"] == 8025
+    assert s["outcome"] == "ok"
+    assert s["last_response_code"] == 221
+    assert s["command_count"] == 6
+    assert s["commands"][0] == "ehlo probe" and s["commands"][-1] == "quit"
+    assert s["credentials"] == ["dgvzda=="]  # lowercased by the pre-existing parser
+    # "Subject: hi\r\n\r\nhello" = 20 bytes; the terminator is excluded.
+    assert s["mail"] == [{"size": 20, "truncated": False}]
+    assert s["mail_size"] == 20
+    assert "commands_truncated" not in s and "timed_out" not in s
+    assert "tls_version" not in s
+
+    # The database still receives the transcript, not the summary.
+    transcript = json.loads(stored["data"])
+    assert isinstance(transcript, list)
+    directions = [e["direction"] for e in transcript]
+    assert directions[0] == "out"                       # banner
+    assert directions.count("in") == 6
+    assert "mail-body" in directions
+    body_entry = next(e for e in transcript if e["direction"] == "mail-body")
+    assert body_entry["size"] == 20 and body_entry["truncated"] is False
+    assert all("timestamp" in e for e in transcript)
+
+
+def test_commands_list_is_capped(event_stream):
+    from mailoney.core import MAX_LOGGED_COMMANDS
+    n = MAX_LOGGED_COMMANDS + 5
+    sock = _mock_socket(*([b"EHLO x\r\n"] * n))
+    h = SMTPHoneypot(bind_ip="127.0.0.1", bind_port=8025)
+    with patch("mailoney.core.update_session_data"):
+        h._handle_client(sock, ("10.0.0.1", 4444))
+    s = _session_ended(event_stream)
+    assert s["command_count"] == n
+    assert len(s["commands"]) == MAX_LOGGED_COMMANDS
+    assert s["commands_truncated"] is True
+
+
+def test_banner_only_session(event_stream):
+    before = metrics.BANNER_ONLY_SESSIONS_TOTAL._value.get()
+    sock = _mock_socket()  # client reads the banner and disconnects
+    h = SMTPHoneypot(bind_ip="127.0.0.1", bind_port=8025)
+    with patch("mailoney.core.update_session_data"):
+        h._handle_client(sock, ("10.0.0.1", 4444))
+    s = _session_ended(event_stream)
+    assert s["command_count"] == 0 and s["commands"] == []
+    assert s["last_response_code"] == 220
+    assert metrics.BANNER_ONLY_SESSIONS_TOTAL._value.get() == before + 1
+
+
+def test_session_events_share_uuid(event_stream):
+    sock = _mock_socket(b"AUTH PLAIN dGVzdA==\r\n", b"QUIT\r\n")
+    h = SMTPHoneypot(bind_ip="127.0.0.1", bind_port=8025)
+    with patch("mailoney.core.update_session_data"):
+        h._handle_client(sock, ("10.0.0.1", 4444))
+    evs = event_stream()
+    assert [e["event"] for e in evs] == ["session_started", "credential_captured", "session_ended"]
+    assert len({e["session_uuid"] for e in evs}) == 1

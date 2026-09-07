@@ -109,7 +109,7 @@ def test_starttls_command_replies_454_when_unconfigured():
     assert "TLS not available" in sent_str
 
 
-def test_starttls_command_invokes_wrap_socket_when_configured(tls_cert_pair):
+def test_starttls_command_invokes_wrap_socket_when_configured(tls_cert_pair, event_stream):
     """With a cert, STARTTLS sends 220 and calls wrap_socket on the peer socket."""
     cert, key = tls_cert_pair
     h = SMTPHoneypot(
@@ -138,6 +138,9 @@ def test_starttls_command_invokes_wrap_socket_when_configured(tls_cert_pair):
     h.tls_context.wrap_socket.assert_called_once()
     # Handshake timeout was set before the upgrade.
     sock.settimeout.assert_any_call(10)
+    # The negotiated version is carried on the session summary.
+    ended = [e for e in event_stream() if e["event"] == "session_ended"]
+    assert ended and ended[0]["tls_version"] == "TLSv1.3"
 
 
 def test_starttls_already_active_replies_503(tls_cert_pair):
@@ -167,6 +170,10 @@ def test_starttls_already_active_replies_503(tls_cert_pair):
     assert "220 2.0.0 Ready to start TLS" in sent_str
     assert "503" in sent_str
     assert "already active" in sent_str
+    # The 503 must have gone out over the *wrapped* socket: proves the
+    # reply helper follows the rebinding done by wrap_socket().
+    assert any(b"503" in c.args[0] for c in wrapped.send.call_args_list)
+    assert not any(b"503" in c.args[0] for c in sock.send.call_args_list)
 
 
 # --- startup validation -----------------------------------------------
