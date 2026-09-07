@@ -8,6 +8,7 @@ post-upgrade EHLO drops STARTTLS, that the command-handler takes the
 right branches, and that ``ssl.SSLContext`` actually loads a real cert
 pair.
 """
+import os
 import socket
 import ssl
 import subprocess
@@ -15,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mailoney.core import SMTPHoneypot
+from mailoney.core import SMTPHoneypot, TLSConfigError, preflight_tls
 
 
 @pytest.fixture(scope="session")
@@ -166,3 +167,120 @@ def test_starttls_already_active_replies_503(tls_cert_pair):
     assert "220 2.0.0 Ready to start TLS" in sent_str
     assert "503" in sent_str
     assert "already active" in sent_str
+
+
+# --- startup validation -----------------------------------------------
+#
+# The cert/key paths are operator-supplied, and the two mistakes that
+# actually happen in the field are a wrong path and a key the process
+# cannot read (certbot and Debian's snakeoil key are both root-owned).
+# preflight_tls runs before init_db so these never masquerade as a
+# database error, and it writes to stderr so the message survives
+# Alembic's logging reconfiguration during migrations.
+
+
+def test_preflight_noop_when_tls_unconfigured(capsys):
+    preflight_tls(None, None)
+    assert capsys.readouterr().err == ""
+
+
+def test_preflight_warns_but_continues_when_only_cert_set(capsys):
+    """Half-configured is a typo, not a reason to refuse to start."""
+    preflight_tls("/some/cert.pem", None)
+    err = capsys.readouterr().err
+    assert "MAILONEY_TLS_KEY" in err
+    assert "plaintext" in err
+
+
+def test_preflight_warns_but_continues_when_only_key_set(capsys):
+    preflight_tls(None, "/some/key.pem")
+    err = capsys.readouterr().err
+    assert "MAILONEY_TLS_CERT" in err
+
+
+def test_preflight_exits_when_cert_missing(capsys):
+    with pytest.raises(SystemExit) as exc:
+        preflight_tls("/nonexistent/fullchain.pem", "/nonexistent/privkey.pem")
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "not found" in err
+    assert "/nonexistent/fullchain.pem" in err
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root bypasses file permission checks, so the key stays readable",
+)
+def test_preflight_exits_when_key_unreadable(tls_cert_pair, tmp_path, capsys):
+    """The certbot / snakeoil case: cert is world-readable, key is not."""
+    cert, key = tls_cert_pair
+    unreadable = tmp_path / "privkey.pem"
+    unreadable.write_bytes(open(key, "rb").read())
+    unreadable.chmod(0o000)
+
+    with pytest.raises(SystemExit) as exc:
+        preflight_tls(cert, str(unreadable))
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "not readable" in err
+    assert "privkey.pem" in err
+    # Names the likely cause rather than leaving the operator guessing.
+    assert "mailoney" in err
+
+
+def test_preflight_exits_on_mismatched_pair(tls_cert_pair, tmp_path, capsys):
+    """A readable but wrong key is caught at startup, not at handshake."""
+    cert, _ = tls_cert_pair
+    other_key = tmp_path / "other-key.pem"
+    other_cert = tmp_path / "other-cert.pem"
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", str(other_key), "-out", str(other_cert),
+            "-days", "1", "-nodes", "-subj", "/CN=other.example.com",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        preflight_tls(cert, str(other_key))
+    assert exc.value.code == 2
+    assert "could not load TLS cert/key pair" in capsys.readouterr().err
+
+
+def test_preflight_accepts_a_valid_pair(tls_cert_pair, capsys):
+    cert, key = tls_cert_pair
+    preflight_tls(cert, key)
+    assert capsys.readouterr().err == ""
+
+
+def test_build_tls_context_raises_tls_config_error(tmp_path):
+    """Bad input surfaces as TLSConfigError, not a bare OSError."""
+    bogus = tmp_path / "not-a-cert.pem"
+    bogus.write_text("this is not PEM\n")
+    with pytest.raises(TLSConfigError):
+        SMTPHoneypot._build_tls_context(str(bogus), str(bogus))
+
+
+def test_snakeoil_style_pair_is_accepted(tmp_path):
+    """Debian's ssl-cert snakeoil pair is an ordinary self-signed pair."""
+    cert = tmp_path / "ssl-cert-snakeoil.pem"
+    key = tmp_path / "ssl-cert-snakeoil.key"
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", str(key), "-out", str(cert),
+            "-days", "3650", "-nodes", "-subj", "/CN=honeypot.local",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    key.chmod(0o640)
+
+    h = SMTPHoneypot(
+        bind_ip="127.0.0.1", bind_port=8025,
+        tls_cert=str(cert), tls_key=str(key),
+    )
+    assert isinstance(h.tls_context, ssl.SSLContext)
+    assert "STARTTLS" in h.ehlo_response

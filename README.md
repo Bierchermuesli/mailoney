@@ -183,26 +183,148 @@ mysql+pymysql://username:password@hostname:port/database
 ## STARTTLS
 
 Mailoney supports the SMTP `STARTTLS` extension when both
-`MAILONEY_TLS_CERT` and `MAILONEY_TLS_KEY` are set:
-
-```bash
-docker run -p 25:25 \
-  -e MAILONEY_TLS_CERT=/etc/letsencrypt/live/mx.example.com/fullchain.pem \
-  -e MAILONEY_TLS_KEY=/etc/letsencrypt/live/mx.example.com/privkey.pem \
-  -v /etc/letsencrypt:/etc/letsencrypt:ro \
-  ghcr.io/phin3has/mailoney:latest
-```
-
-When configured:
-- The `EHLO` response advertises `STARTTLS`. After a successful upgrade,
-  the post-TLS `EHLO` drops the line per RFC 3207 §4.2.
-- The handshake is pinned to TLS 1.2 minimum.
-- A 10-second handshake timeout protects against half-open clients.
-- Cert and key are loaded once at process start. Restart the container
-  after a certbot renewal to pick up the new cert.
+`MAILONEY_TLS_CERT` and `MAILONEY_TLS_KEY` are set. Any cert/key pair
+works — the server presents the cert and never verifies anything, so a
+self-signed cert is perfectly adequate for a honeypot.
 
 When unconfigured, `EHLO` does not advertise `STARTTLS`, and an explicit
 `STARTTLS` command from a client gets `454 4.7.0 TLS not available`.
+
+### A note on file permissions
+
+The container image runs as the unprivileged `mailoney` user, and
+private keys are root-owned and mode `0600`/`0640` almost everywhere
+they are generated. Bind-mounting `/etc/letsencrypt` or `/etc/ssl`
+straight into the container therefore does **not** work on its own —
+the process cannot read the key.
+
+Mailoney checks this at startup and exits with status 2 and an explicit
+message rather than failing later at handshake time:
+
+```
+[!] STARTTLS: TLS key is not readable: /etc/letsencrypt/live/mx.example.com/privkey.pem
+```
+
+Two ways to resolve it, in order of preference:
+
+1. **Copy the pair to a location the container user can read** (below).
+2. **Pin the container to a known UID** with `user:` in compose, and
+   `chown` the copied files to it.
+
+Running the container as root also works but gives up the image's
+privilege separation, which is a poor trade for a service that
+deliberately accepts hostile input on port 25.
+
+### Self-signed certificate
+
+Generate a throwaway pair:
+
+```bash
+mkdir -p ./tls
+openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+  -keyout ./tls/privkey.pem -out ./tls/fullchain.pem \
+  -subj "/CN=mx.example.com"
+chmod 640 ./tls/privkey.pem
+```
+
+On Debian/Ubuntu the `ssl-cert` package's *snakeoil* pair works too, but
+it lives in `/etc/ssl/private` (mode `0710`, group `ssl-cert`) and the
+key is `0640 root:ssl-cert`, so copy it out rather than mounting it:
+
+```bash
+mkdir -p ./tls
+sudo install -m 0644 /etc/ssl/certs/ssl-cert-snakeoil.pem ./tls/fullchain.pem
+sudo install -m 0640 /etc/ssl/private/ssl-cert-snakeoil.key ./tls/privkey.pem
+sudo chown -R 1000:1000 ./tls
+```
+
+Either way, mount the directory and pin the user:
+
+```yaml
+services:
+  mailoney:
+    image: ghcr.io/phin3has/mailoney:latest
+    user: "1000:1000"
+    ports:
+      - "25:25"
+    environment:
+      - MAILONEY_TLS_CERT=/tls/fullchain.pem
+      - MAILONEY_TLS_KEY=/tls/privkey.pem
+    volumes:
+      - ./tls:/tls:ro
+```
+
+### Let's Encrypt / certbot
+
+Certbot writes `privkey.pem` as `0600 root:root`, so the honeypot
+container cannot read it from a bind mount. Use a **deploy hook** to
+publish a readable copy on every renewal, then restart the container so
+the new cert is picked up:
+
+```bash
+# /etc/letsencrypt/renewal-hooks/deploy/mailoney.sh   (chmod +x)
+#!/bin/sh
+set -eu
+DEST=/srv/mailoney/tls
+install -d -m 0750 -o 1000 -g 1000 "$DEST"
+install -m 0644 -o 1000 -g 1000 "$RENEWED_LINEAGE/fullchain.pem" "$DEST/fullchain.pem"
+install -m 0640 -o 1000 -g 1000 "$RENEWED_LINEAGE/privkey.pem"   "$DEST/privkey.pem"
+docker compose -f /srv/mailoney/docker-compose.yml restart mailoney
+```
+
+`$RENEWED_LINEAGE` is set by certbot to the `live/<domain>` directory
+being renewed, so the hook needs no per-domain editing. It runs on
+issuance and on every successful renewal.
+
+```yaml
+services:
+  mailoney:
+    image: ghcr.io/phin3has/mailoney:latest
+    user: "1000:1000"
+    ports:
+      - "25:25"
+    environment:
+      - MAILONEY_TLS_CERT=/tls/fullchain.pem
+      - MAILONEY_TLS_KEY=/tls/privkey.pem
+    volumes:
+      - /srv/mailoney/tls:/tls:ro
+```
+
+Using a real cert for a honeypot is a deliberate choice: it makes the
+listener look like production infrastructure, at the cost of tying a
+domain you control to it (and publishing the hostname in the
+Certificate Transparency logs). A self-signed cert leaks nothing but is
+a fingerprintable signal in itself. Neither is wrong — pick per
+deployment.
+
+### Behaviour
+
+- The `EHLO` response advertises `STARTTLS`. After a successful upgrade,
+  the post-TLS `EHLO` drops the line per RFC 3207 §4.2.
+- The handshake is pinned to TLS 1.2 minimum.
+- A 10-second handshake timeout protects against half-open clients; the
+  per-connection inactivity timeout is restored afterwards, so an
+  upgraded connection is bounded exactly like a plaintext one.
+- The upgrade is recorded in the session log as a `tls-upgrade` entry
+  carrying the negotiated version.
+- A repeat `STARTTLS` on an encrypted connection gets
+  `503 5.5.1 STARTTLS already active`.
+- Cert and key are loaded **once at process start**. Restart the
+  container after a renewal — hence the `restart` in the deploy hook
+  above.
+
+### Startup validation
+
+TLS configuration is checked before the database is touched, so a cert
+problem never surfaces as a database error:
+
+| Condition | Behaviour |
+|---|---|
+| Neither cert nor key set | STARTTLS disabled, no message (the default) |
+| Only one of the two set | Warning on stderr; server starts, plaintext only |
+| Path missing | `exit 2`, names the missing file |
+| Path unreadable | `exit 2`, names the file and the likely cause |
+| Cert/key mismatch, malformed PEM | `exit 2`, reports the OpenSSL error |
 
 ## Database Schema
 

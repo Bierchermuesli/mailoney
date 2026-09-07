@@ -1,6 +1,7 @@
 """
 Core functionality for the Mailoney SMTP Honeypot
 """
+import os
 import re
 import socket
 import ssl
@@ -16,6 +17,10 @@ from typing import Optional, Tuple, Dict, Any, List
 from .db import create_session, update_session_data, log_credential, init_db
 from .config import get_settings, configure_logging
 from .mail_storage import store_mail_body
+
+class TLSConfigError(Exception):
+    """Raised when the configured TLS cert/key pair cannot be used."""
+
 
 # Seconds to allow for the TLS handshake on STARTTLS. Without this, a
 # malicious peer can stall a worker thread indefinitely by opening a
@@ -87,6 +92,9 @@ class SMTPHoneypot:
         if tls_cert and tls_key:
             self.tls_context = self._build_tls_context(tls_cert, tls_key)
         else:
+            # Half-configured (one of the two set) leaves TLS off. The
+            # operator-facing warning for that lives in preflight_tls,
+            # which runs before migrations reconfigure logging.
             self.tls_context = None
 
         # Pre-TLS EHLO advertises STARTTLS only when we can actually serve
@@ -123,7 +131,13 @@ class SMTPHoneypot:
         """
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+        try:
+            ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+        except (OSError, ssl.SSLError) as e:
+            raise TLSConfigError(
+                f"could not load TLS cert/key pair "
+                f"({cert_path!r}, {key_path!r}): {e}"
+            ) from e
         return ctx
         
     def start(self) -> None:
@@ -518,6 +532,61 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def preflight_tls(tls_cert: Optional[str], tls_key: Optional[str]) -> None:
+    """Validate the TLS configuration before any other startup work.
+
+    Deliberately runs ahead of ``init_db``: a mistyped cert path should
+    not surface as a database error, and writing to stderr keeps the
+    message visible even though Alembic reconfigures logging while
+    applying migrations.
+
+    Exits with status 2 on a cert/key pair that is set but unusable —
+    an operator who asked for TLS is better served by a hard failure
+    than by a honeypot that quietly falls back to plaintext.
+    """
+    if not tls_cert and not tls_key:
+        return
+
+    if bool(tls_cert) != bool(tls_key):
+        # Almost always a typo in one of the two env vars. Not fatal --
+        # a honeypot should stay up -- but silence here would leave the
+        # operator believing STARTTLS is live when it is not.
+        missing = "key (MAILONEY_TLS_KEY)" if tls_cert else "cert (MAILONEY_TLS_CERT)"
+        print(
+            f"[!] STARTTLS: TLS {missing} is not set, so STARTTLS stays\n"
+            "    disabled and the honeypot serves plaintext only. Both the\n"
+            "    cert and the key are required to enable it.",
+            file=sys.stderr,
+        )
+        return
+
+    for label, path in (("cert", tls_cert), ("key", tls_key)):
+        if not os.path.exists(path):
+            print(
+                f"[!] STARTTLS: TLS {label} not found: {path}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if not os.access(path, os.R_OK):
+            print(
+                f"[!] STARTTLS: TLS {label} is not readable: {path}\n"
+                "    The container image runs as the unprivileged 'mailoney'\n"
+                "    user. Certbot keys under /etc/letsencrypt/ and Debian's\n"
+                "    snakeoil key are root-owned by default -- see the\n"
+                "    STARTTLS section of the README for the usual fixes.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    # Both readable: load them now so a malformed or mismatched pair is
+    # reported here rather than as an opaque failure further in.
+    try:
+        SMTPHoneypot._build_tls_context(tls_cert, tls_key)
+    except TLSConfigError as e:
+        print(f"[!] STARTTLS: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
 def display_banner() -> None:
     """Display the Mailoney banner"""
     from . import __version__
@@ -543,7 +612,10 @@ def run_server() -> None:
     
     # Display banner
     display_banner()
-    
+
+    # Validate TLS config before touching the database (see preflight_tls).
+    preflight_tls(args.tls_cert, args.tls_key)
+
     # Initialize database
     logger.info(f"Initializing database with URL: {args.db_url}")
     init_db(args.db_url)
