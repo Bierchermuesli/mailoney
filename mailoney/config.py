@@ -41,6 +41,15 @@ class Settings(BaseSettings):
 
     # Logging settings
     log_level: str = Field(default="INFO")
+
+    # Prometheus metrics. metrics_port unset (None) disables the /metrics
+    # endpoint. metrics_bind defaults to loopback: the exposition names the
+    # honeypot software and version, so it must never be reachable from the
+    # same networks the SMTP listener is exposed to. Set it to 0.0.0.0 or ::
+    # only when scraping from another host or container, and keep the port
+    # unpublished or bound to a private interface.
+    metrics_port: Optional[int] = Field(default=None)
+    metrics_bind: str = Field(default="127.0.0.1")
     
     # Configure the settings to use the MAILONEY_ prefix for environment variables
     model_config = SettingsConfigDict(

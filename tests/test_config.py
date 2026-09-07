@@ -8,12 +8,22 @@ from mailoney.config import get_settings, configure_logging, Settings
 def test_default_settings():
     """Test default settings"""
     settings = get_settings()
-    
+
     assert settings.bind_ip == "0.0.0.0"
     assert settings.bind_port == 25
     assert settings.server_name == "mail.example.com"
     assert settings.db_url == "sqlite:///mailoney.db"
     assert settings.log_level == "INFO"
+    assert settings.metrics_port is None
+    assert settings.metrics_bind == "127.0.0.1"
+
+
+def test_metrics_env(monkeypatch):
+    monkeypatch.setenv("MAILONEY_METRICS_PORT", "9025")
+    monkeypatch.setenv("MAILONEY_METRICS_BIND", "127.0.0.1")
+    settings = Settings()
+    assert settings.metrics_port == 9025
+    assert settings.metrics_bind == "127.0.0.1"
 
 def test_env_settings(monkeypatch):
     """Test settings from environment variables"""

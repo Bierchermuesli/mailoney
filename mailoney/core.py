@@ -10,6 +10,7 @@ import logging
 import json
 import sys
 import uuid
+import time
 import argparse
 from time import strftime
 from typing import Optional, Tuple, Dict, Any, List
@@ -17,6 +18,7 @@ from typing import Optional, Tuple, Dict, Any, List
 from .db import create_session, update_session_data, log_credential, init_db
 from .config import get_settings, configure_logging
 from .mail_storage import store_mail_body
+from . import metrics
 
 class TLSConfigError(Exception):
     """Raised when the configured TLS cert/key pair cannot be used."""
@@ -247,6 +249,10 @@ class SMTPHoneypot:
             addr: Client address tuple (ip, port)
         """
         session_uuid = str(uuid.uuid4())
+        metrics.CONNECTIONS_TOTAL.inc()
+        metrics.ACTIVE_SESSIONS.inc()
+        session_started = time.monotonic()
+        session_outcome = "ok"
         session_record = create_session(
             addr[0], addr[1], self.server_name,
             dest_ip=self.bind_ip,
@@ -279,6 +285,9 @@ class SMTPHoneypot:
 
                     session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "in", "data": request})
                     logger.debug(f"Client: {request}")
+                    metrics.COMMANDS_TOTAL.labels(
+                        command=metrics.classify_command(request)
+                    ).inc()
 
                     # Handle EHLO/HELO. Use the post-TLS variant once a
                     # STARTTLS upgrade has succeeded (no STARTTLS line).
@@ -333,6 +342,7 @@ class SMTPHoneypot:
                         parts = request.split()
                         if len(parts) >= 3:
                             auth_string = parts[2]
+                            metrics.CREDENTIALS_CAPTURED_TOTAL.inc()
                             log_credential(session_record.id, auth_string)
                             logger.info(f"Captured credential: {auth_string}")
 
@@ -425,6 +435,10 @@ class SMTPHoneypot:
                     except OSError:
                         pass
                     session_log.append({"timestamp": strftime("%Y-%m-%d %H:%M:%S"), "direction": "out", "data": timeout_reply})
+                    # Distinct from "ok": an idle drop is not a session
+                    # that ran to completion, and operators watching the
+                    # metric want slow-loris pressure to be visible.
+                    session_outcome = "timeout"
                     break
 
                 except Exception as e:
@@ -436,7 +450,13 @@ class SMTPHoneypot:
 
         except Exception as e:
             logger.error(f"Error in client handler: {e}")
+            session_outcome = "error"
         finally:
+            metrics.SESSIONS_TOTAL.labels(result=session_outcome).inc()
+            metrics.SESSION_DURATION_SECONDS.observe(time.monotonic() - session_started)
+            if not any(entry.get("direction") == "in" for entry in session_log):
+                metrics.BANNER_ONLY_SESSIONS_TOTAL.inc()
+            metrics.ACTIVE_SESSIONS.dec()
             try:
                 client_socket.close()
             except OSError:
@@ -529,6 +549,26 @@ def parse_args() -> argparse.Namespace:
         help='Log level'
     )
 
+    parser.add_argument(
+        '--metrics-port',
+        type=int,
+        default=get_settings().metrics_port,
+        help=(
+            'Port to serve Prometheus /metrics on. '
+            'If unset, the metrics endpoint is disabled.'
+        )
+    )
+
+    parser.add_argument(
+        '--metrics-bind',
+        default=get_settings().metrics_bind,
+        help=(
+            'Bind address for the /metrics endpoint (default: 127.0.0.1, '
+            'loopback only). Use 0.0.0.0 or :: to scrape from another host '
+            'or container, and keep that port off any public interface.'
+        )
+    )
+
     return parser.parse_args()
 
 
@@ -619,7 +659,11 @@ def run_server() -> None:
     # Initialize database
     logger.info(f"Initializing database with URL: {args.db_url}")
     init_db(args.db_url)
-    
+
+    # Start Prometheus /metrics endpoint if requested
+    if args.metrics_port:
+        metrics.start_metrics_server(args.metrics_port, args.metrics_bind)
+
     # Create and start server
     try:
         server = SMTPHoneypot(

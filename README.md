@@ -119,6 +119,8 @@ python main.py
 | `MAILONEY_TLS_CERT` | Path to a PEM cert/chain. Both `MAILONEY_TLS_CERT` and `MAILONEY_TLS_KEY` must be set to enable STARTTLS. | (unset) |
 | `MAILONEY_TLS_KEY` | Path to the PEM private key matching `MAILONEY_TLS_CERT`. | (unset) |
 | `MAILONEY_LOG_LEVEL` | Logging level | INFO |
+| `MAILONEY_METRICS_PORT` | Port for the Prometheus `/metrics` endpoint. Unset disables the endpoint. | (unset) |
+| `MAILONEY_METRICS_BIND` | Bind address for the metrics endpoint. Loopback by default; set `0.0.0.0` or `::` only to scrape from another host/container, and keep that port off public interfaces (see [Prometheus Metrics](#prometheus-metrics)). | `127.0.0.1` |
 
 ### Command-line Arguments
 
@@ -138,6 +140,8 @@ Available arguments:
 - `--tls-cert`: Path to a PEM cert/chain (enables STARTTLS together with --tls-key)
 - `--tls-key`: Path to the PEM private key matching --tls-cert
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+- `--metrics-port`: Port for the Prometheus `/metrics` endpoint (unset = disabled)
+- `--metrics-bind`: Bind address for the metrics endpoint (default: `127.0.0.1`, loopback only)
 
 ### Captured mail bodies
 
@@ -325,6 +329,81 @@ problem never surfaces as a database error:
 | Path missing | `exit 2`, names the missing file |
 | Path unreadable | `exit 2`, names the file and the likely cause |
 | Cert/key mismatch, malformed PEM | `exit 2`, reports the OpenSSL error |
+
+## Prometheus Metrics
+
+Mailoney can expose a `/metrics` endpoint for Prometheus scraping when
+`MAILONEY_METRICS_PORT` is set (or `--metrics-port` is passed).
+
+> **Keep this endpoint off the internet.** The exposition is unauthenticated,
+> is served on every path, and includes `mailoney_build_info` — the software
+> name and version. Anyone who can reach it learns in one request that the
+> "mail server" is a honeypot. The endpoint therefore binds to loopback
+> (`127.0.0.1`) by default, and Mailoney logs a warning at startup whenever
+> it is bound anywhere else.
+
+Running directly on the host, the default just works and Prometheus on the
+same machine scrapes `127.0.0.1:9025`:
+
+```bash
+MAILONEY_METRICS_PORT=9025 python main.py
+```
+
+In Docker, port publishing forwards to the container's network interface,
+not its loopback, so the container-side bind must be widened to `0.0.0.0`
+(or `::`) and the exposure controlled on the Docker side instead. Two safe
+patterns:
+
+**Scrape over an internal network, publish nothing.** Prometheus and
+Mailoney share a compose network; only port 25 reaches the outside:
+
+```yaml
+services:
+  mailoney:
+    image: ghcr.io/phin3has/mailoney:latest
+    ports:
+      - "25:25"                     # only the honeypot port is published
+    environment:
+      - MAILONEY_METRICS_PORT=9025
+      - MAILONEY_METRICS_BIND=0.0.0.0
+    networks: [monitoring]
+
+  prometheus:
+    image: prom/prometheus
+    networks: [monitoring]          # scrapes http://mailoney:9025/metrics
+
+networks:
+  monitoring:
+```
+
+**Publish to the host's loopback only.** For a Prometheus that runs on the
+Docker host itself:
+
+```bash
+docker run -p 25:25 -p 127.0.0.1:9025:9025 \
+  -e MAILONEY_METRICS_PORT=9025 \
+  -e MAILONEY_METRICS_BIND=0.0.0.0 \
+  ghcr.io/phin3has/mailoney:latest
+```
+
+Never use a bare `-p 9025:9025` on an internet-facing host: that publishes
+the fingerprint on every interface.
+
+Exposed metrics:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `mailoney_smtp_connections_total` | Counter | — | SMTP connections accepted. |
+| `mailoney_smtp_sessions_total` | Counter | `result` (`ok`/`error`/`timeout`) | SMTP sessions that ran to completion. `timeout` is an inactivity drop, reported separately so slow-loris pressure is visible. |
+| `mailoney_smtp_credentials_captured_total` | Counter | — | AUTH PLAIN credentials captured. |
+| `mailoney_smtp_commands_total` | Counter | `command` | SMTP commands by verb (`ehlo`, `helo`, `auth`, `starttls`, `mail`, `rcpt`, `data`, `quit`, `unknown`). |
+| `mailoney_smtp_active_sessions` | Gauge | — | Sessions currently in flight. |
+| `mailoney_smtp_session_duration_seconds` | Histogram | — | Time from accept to close, per session. |
+| `mailoney_smtp_banner_only_sessions_total` | Counter | — | Sessions where the client connected but never sent a command (port-scanner signal). |
+| `mailoney_start_time_seconds` | Gauge | — | Unix timestamp at process start. Compute uptime in PromQL with `time() - mailoney_start_time_seconds`. |
+| `mailoney_build_info` | Info | `version` | Mailoney build/version info. |
+
+`MAILONEY_METRICS_BIND` (or `--metrics-bind`) overrides the bind address.
 
 ## Database Schema
 
