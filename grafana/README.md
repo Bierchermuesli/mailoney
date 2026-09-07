@@ -54,6 +54,13 @@ scrape_configs:
           - mailoney:9025      # MAILONEY_METRICS_PORT
 ```
 
+For a containerised Mailoney this requires `MAILONEY_METRICS_BIND=0.0.0.0`
+(the default is loopback, which Docker port-forwarding cannot reach) and a
+shared network between the two containers. Do **not** publish the metrics
+port on a public interface — the exposition identifies the host as a
+honeypot. See the "Prometheus Metrics" section of the main README for the
+safe compose layout.
+
 Nothing else to do — the dashboard's PromQL queries work as-is on
 both Prometheus and VictoriaMetrics (VM speaks the Prom protocol).
 

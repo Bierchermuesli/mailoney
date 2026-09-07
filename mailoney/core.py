@@ -443,7 +443,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--metrics-bind',
         default=get_settings().metrics_bind,
-        help='Bind address for the /metrics endpoint (default: ::, dual-stack)'
+        help=(
+            'Bind address for the /metrics endpoint (default: 127.0.0.1, '
+            'loopback only). Use 0.0.0.0 or :: to scrape from another host '
+            'or container, and keep that port off any public interface.'
+        )
     )
 
     return parser.parse_args()

@@ -118,7 +118,7 @@ python main.py
 | `MAILONEY_MAIL_DIR` | When set, captured SMTP message bodies are written under this directory as `<YYYY-MM-DD>/<src-ip>/<session>.eml` and the session log records the relative path. Unset = bodies are discarded after their metadata (size, truncated flag) is recorded. Operators opt *in* to body retention. | (unset) |
 | `MAILONEY_LOG_LEVEL` | Logging level | INFO |
 | `MAILONEY_METRICS_PORT` | Port for the Prometheus `/metrics` endpoint. Unset disables the endpoint. | (unset) |
-| `MAILONEY_METRICS_BIND` | Bind address for the metrics endpoint. Default is dual-stack IPv4+IPv6. | `::` |
+| `MAILONEY_METRICS_BIND` | Bind address for the metrics endpoint. Loopback by default; set `0.0.0.0` or `::` only to scrape from another host/container, and keep that port off public interfaces (see [Prometheus Metrics](#prometheus-metrics)). | `127.0.0.1` |
 
 ### Command-line Arguments
 
@@ -137,7 +137,7 @@ Available arguments:
 - `--mail-dir`: Directory under which captured message bodies are written
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 - `--metrics-port`: Port for the Prometheus `/metrics` endpoint (unset = disabled)
-- `--metrics-bind`: Bind address for the metrics endpoint (default: `::`)
+- `--metrics-bind`: Bind address for the metrics endpoint (default: `127.0.0.1`, loopback only)
 
 ### Captured mail bodies
 
@@ -183,21 +183,68 @@ mysql+pymysql://username:password@hostname:port/database
 ## Prometheus Metrics
 
 Mailoney can expose a `/metrics` endpoint for Prometheus scraping when
-`MAILONEY_METRICS_PORT` is set (or `--metrics-port` is passed). A typical
-deployment:
+`MAILONEY_METRICS_PORT` is set (or `--metrics-port` is passed).
+
+> **Keep this endpoint off the internet.** The exposition is unauthenticated,
+> is served on every path, and includes `mailoney_build_info` — the software
+> name and version. Anyone who can reach it learns in one request that the
+> "mail server" is a honeypot. The endpoint therefore binds to loopback
+> (`127.0.0.1`) by default, and Mailoney logs a warning at startup whenever
+> it is bound anywhere else.
+
+Running directly on the host, the default just works and Prometheus on the
+same machine scrapes `127.0.0.1:9025`:
 
 ```bash
-docker run -p 25:25 -p 9025:9025 \
+MAILONEY_METRICS_PORT=9025 python main.py
+```
+
+In Docker, port publishing forwards to the container's network interface,
+not its loopback, so the container-side bind must be widened to `0.0.0.0`
+(or `::`) and the exposure controlled on the Docker side instead. Two safe
+patterns:
+
+**Scrape over an internal network, publish nothing.** Prometheus and
+Mailoney share a compose network; only port 25 reaches the outside:
+
+```yaml
+services:
+  mailoney:
+    image: ghcr.io/phin3has/mailoney:latest
+    ports:
+      - "25:25"                     # only the honeypot port is published
+    environment:
+      - MAILONEY_METRICS_PORT=9025
+      - MAILONEY_METRICS_BIND=0.0.0.0
+    networks: [monitoring]
+
+  prometheus:
+    image: prom/prometheus
+    networks: [monitoring]          # scrapes http://mailoney:9025/metrics
+
+networks:
+  monitoring:
+```
+
+**Publish to the host's loopback only.** For a Prometheus that runs on the
+Docker host itself:
+
+```bash
+docker run -p 25:25 -p 127.0.0.1:9025:9025 \
   -e MAILONEY_METRICS_PORT=9025 \
+  -e MAILONEY_METRICS_BIND=0.0.0.0 \
   ghcr.io/phin3has/mailoney:latest
 ```
+
+Never use a bare `-p 9025:9025` on an internet-facing host: that publishes
+the fingerprint on every interface.
 
 Exposed metrics:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `mailoney_smtp_connections_total` | Counter | — | SMTP connections accepted. |
-| `mailoney_smtp_sessions_total` | Counter | `result` (`ok`/`error`) | SMTP sessions that ran to completion. |
+| `mailoney_smtp_sessions_total` | Counter | `result` (`ok`/`error`/`timeout`) | SMTP sessions that ran to completion. `timeout` is an inactivity drop, reported separately so slow-loris pressure is visible. |
 | `mailoney_smtp_credentials_captured_total` | Counter | — | AUTH PLAIN credentials captured. |
 | `mailoney_smtp_commands_total` | Counter | `command` | SMTP commands by verb (`ehlo`, `helo`, `auth`, `mail`, `rcpt`, `data`, `quit`, `unknown`). |
 | `mailoney_smtp_active_sessions` | Gauge | — | Sessions currently in flight. |
@@ -206,8 +253,7 @@ Exposed metrics:
 | `mailoney_start_time_seconds` | Gauge | — | Unix timestamp at process start. Compute uptime in PromQL with `time() - mailoney_start_time_seconds`. |
 | `mailoney_build_info` | Info | `version` | Mailoney build/version info. |
 
-The endpoint binds dual-stack (`::`) by default. Override with
-`MAILONEY_METRICS_BIND=127.0.0.1` if you want loopback-only.
+`MAILONEY_METRICS_BIND` (or `--metrics-bind`) overrides the bind address.
 
 ## Database Schema
 

@@ -15,7 +15,7 @@ def test_default_settings():
     assert settings.db_url == "sqlite:///mailoney.db"
     assert settings.log_level == "INFO"
     assert settings.metrics_port is None
-    assert settings.metrics_bind == "::"
+    assert settings.metrics_bind == "127.0.0.1"
 
 
 def test_metrics_env(monkeypatch):

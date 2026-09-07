@@ -65,10 +65,13 @@ def test_credentials_counter_increments():
 def test_sessions_counter_partitions_by_result():
     before_ok = _counter_value(SESSIONS_TOTAL, result="ok")
     before_err = _counter_value(SESSIONS_TOTAL, result="error")
+    before_timeout = _counter_value(SESSIONS_TOTAL, result="timeout")
     SESSIONS_TOTAL.labels(result="ok").inc()
     SESSIONS_TOTAL.labels(result="error").inc()
+    SESSIONS_TOTAL.labels(result="timeout").inc()
     assert _counter_value(SESSIONS_TOTAL, result="ok") == before_ok + 1
     assert _counter_value(SESSIONS_TOTAL, result="error") == before_err + 1
+    assert _counter_value(SESSIONS_TOTAL, result="timeout") == before_timeout + 1
 
 
 def test_commands_counter_partitions_by_verb():
@@ -103,7 +106,7 @@ def test_session_duration_histogram_records_observations():
     SESSION_DURATION_SECONDS.observe(0.05)
     SESSION_DURATION_SECONDS.observe(2.5)
     SESSION_DURATION_SECONDS.observe(120.0)
-    assert SESSION_DURATION_SECONDS._sum.get() == before_count + 0.05 + 2.5 + 120.0
+    assert SESSION_DURATION_SECONDS._sum.get() == pytest.approx(before_count + 0.05 + 2.5 + 120.0)
 
 
 def test_start_time_gauge_is_set_at_import():
@@ -141,12 +144,32 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def test_default_bind_is_loopback():
+    """The exposition fingerprints the honeypot; the default must not
+    put it on the network."""
+    import inspect
+    default = inspect.signature(start_metrics_server).parameters["bind"].default
+    assert default == "127.0.0.1"
+    assert default in metrics._LOOPBACK_BINDS
+
+
+def test_non_loopback_bind_logs_warning(caplog, monkeypatch):
+    """Opting into a network-reachable bind is allowed but loud."""
+    import logging
+    monkeypatch.setattr(metrics, "start_http_server", lambda port, addr: None)
+    with caplog.at_level(logging.WARNING, logger="mailoney.metrics"):
+        start_metrics_server(port=1, bind="0.0.0.0")
+    assert any("honeypot" in r.getMessage() for r in caplog.records)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="mailoney.metrics"):
+        start_metrics_server(port=1, bind="127.0.0.1")
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 def test_metrics_server_serves_exposition():
     """Spin up the real HTTP server and fetch /metrics."""
     port = _free_port()
-    # Bind to localhost specifically (don't bind dual-stack in tests, to
-    # avoid permission/firewall surprises).
-    start_metrics_server(port=port, bind="127.0.0.1")
+    start_metrics_server(port=port)
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=2) as resp:
         body = resp.read().decode()
     assert "mailoney_smtp_connections_total" in body

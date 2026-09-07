@@ -94,11 +94,27 @@ def classify_command(request: str) -> str:
     return "unknown"
 
 
-def start_metrics_server(port: int, bind: str = "::") -> None:
+# Bind addresses that keep the endpoint on the local host only.
+_LOOPBACK_BINDS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def start_metrics_server(port: int, bind: str = "127.0.0.1") -> None:
     """Start the Prometheus /metrics HTTP endpoint as a daemon thread.
 
-    ``bind`` defaults to ``::`` so the listener accepts both IPv4 (mapped)
-    and IPv6 connections on Linux's default dual-stack configuration.
+    ``bind`` defaults to loopback. The exposition includes
+    ``mailoney_build_info`` (software name + version) and is served
+    without authentication on every path, so a wildcard bind on a host
+    that is also internet-exposed hands attackers a one-request honeypot
+    fingerprint. Operators who scrape from another host or container
+    opt in with ``0.0.0.0`` / ``::`` and must keep the port off the
+    public interface.
     """
+    if bind not in _LOOPBACK_BINDS:
+        logger.warning(
+            f"Prometheus /metrics endpoint is bound to {bind}:{port}, which is "
+            "reachable from the network. The exposition identifies this host as "
+            "a Mailoney honeypot; make sure this port is not exposed to the "
+            "same networks as the SMTP listener."
+        )
     logger.info(f"Starting Prometheus /metrics endpoint on [{bind}]:{port}")
     start_http_server(port, addr=bind)
